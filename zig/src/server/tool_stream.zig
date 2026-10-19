@@ -1,4 +1,4 @@
-//! Tool calls while they are written: XML calls as argument deltas, and the one-call policy's text filter.
+//! Tool calls while they are written: XML and DeepSeek-V4.1 DSML calls as argument deltas, and the one-call policy's text filter.
 const std = @import("std");
 const json = @import("json.zig");
 const ids = @import("ids.zig");
@@ -9,6 +9,15 @@ const Value = json.Value;
 const Allocator = std.mem.Allocator;
 
 const space = reply_text.isSpaceByte;
+
+const dsml41_open = tool_parse.dsml41_open;
+const dsml41_close = tool_parse.dsml41_close;
+const invoke41_open = tool_parse.invoke41_open;
+const invoke41_close = tool_parse.invoke41_close;
+const param41_open = tool_parse.param41_open;
+const param41_close = tool_parse.param41_close;
+const string_true = " string=\"true\"";
+const string_false = " string=\"false\"";
 
 /// ``\s*<TAG=([^>\n]+)>\n?`` at the start of ``rest``: the name and the bytes matched.
 fn opening(rest: []const u8, tag: []const u8) ?struct { name: []const u8, len: usize, newline: bool } {
@@ -49,6 +58,15 @@ pub const Streamer = struct {
     held: []const u8 = "",
     streamed: bool = false,
     searched: usize = 0, // the answer is only ever extended, so prose already searched holds no opener
+    dsml: Dsml = .{},
+
+    /// Where ``feedDsml`` is in the answer, apart from the XML calls' state.
+    const Dsml = struct {
+        pos: usize = 0,
+        searched: usize = 0,
+        state: enum { outside, block, invoke, string_value, json_value, skip } = .outside,
+        args_open: bool = false,
+    };
 
     pub fn init(a: Allocator, tools: []const Value) Allocator.Error!Streamer {
         var s: Streamer = .{ .a = a, .schemas = try tool_params.schemas(a, tools) };
@@ -74,6 +92,140 @@ pub const Streamer = struct {
     fn esc(s: *Streamer, text: []const u8) Allocator.Error![]const u8 {
         const q = try json.quote(s.a, text, .{ .ascii = false });
         return q[1 .. q.len - 1];
+    }
+
+    /// A new call's opening delta: its index, id and name, no arguments yet.
+    fn opened(s: *Streamer, name: []const u8, out: *std.ArrayList(Value)) Allocator.Error!void {
+        s.index += 1;
+        s.streamed = true;
+        const function = try json.newObject(s.a);
+        try function.put(s.a, "name", .{ .string = name });
+        try function.put(s.a, "arguments", .{ .string = "" });
+        const one = try json.newObject(s.a);
+        try one.put(s.a, "index", try json.intValue(s.a, s.index));
+        try one.put(s.a, "id", .{ .string = try ids.make(s.a, "call_", 24) });
+        try one.put(s.a, "type", .{ .string = "function" });
+        try one.put(s.a, "function", .{ .object = function });
+        try out.append(s.a, try wrap(s.a, .{ .object = one }));
+    }
+
+    /// The deltas DeepSeek-V4.1's calls blocks in ``text`` (the whole answer so far) add, read as ``tool_parse.dsml41Calls`` reads them:
+    /// an invoke's opening delta once its name is whole, a string value's text as it is written, a JSON value (``string="false"``) at its closer.
+    /// A call the reply's length cuts off stays open, as one ``feed`` streamed does.
+    pub fn feedDsml(s: *Streamer, text: []const u8, out: *std.ArrayList(Value)) Allocator.Error!void {
+        const d = &s.dsml;
+        while (d.pos <= text.len) {
+            const rest = text[d.pos..];
+            switch (d.state) {
+                .outside => {
+                    const from = @max(d.pos, d.searched -| (dsml41_open.len - 1));
+                    const j = reply_text.findTag(text, from, dsml41_open) orelse {
+                        d.searched = text.len;
+                        return;
+                    };
+                    d.pos = j + dsml41_open.len;
+                    d.state = .block;
+                },
+                .block => {
+                    const at = reply_text.findTag(rest, 0, invoke41_open);
+                    if (reply_text.findTag(rest, 0, dsml41_close)) |c| if (at == null or c < at.?) {
+                        d.pos += c + dsml41_close.len;
+                        d.state = .outside;
+                        continue;
+                    };
+                    const start = (at orelse return) + invoke41_open.len;
+                    const q = std.mem.indexOfScalarPos(u8, rest, start, '"') orelse return;
+                    if (q + 1 == rest.len) return;
+                    if (q == start or rest[q + 1] != '>') {
+                        d.pos += at.? + 1;
+                        continue;
+                    }
+                    const name = reply_text.pyStrip(rest[start..q]);
+                    d.pos += q + 2;
+                    if (name.len == 0) {
+                        d.state = .skip; // the parse drops a nameless invoke
+                        continue;
+                    }
+                    const lower = try std.ascii.allocLowerString(s.a, name);
+                    try s.opened(s.known.get(lower) orelse name, out); // an unoffered tool is a call under the name it was given
+                    d.args_open = false;
+                    d.state = .invoke;
+                },
+                .invoke => {
+                    const p = reply_text.findTag(rest, 0, param41_open);
+                    if (reply_text.findTag(rest, 0, invoke41_close)) |e| if (p == null or e < p.?) {
+                        try out.append(s.a, try s.args(if (d.args_open) "}" else "{}"));
+                        d.pos += e + invoke41_close.len;
+                        d.state = .block;
+                        continue;
+                    };
+                    const ps = p orelse return;
+                    const ns = ps + param41_open.len;
+                    const nq = std.mem.indexOfScalarPos(u8, rest, ns, '"') orelse return;
+                    if (nq == ns) {
+                        d.pos += ps + 1;
+                        continue;
+                    }
+                    var v = nq + 1;
+                    var json_value = false;
+                    const flag = rest[v..];
+                    if (std.mem.startsWith(u8, flag, string_true)) {
+                        v += string_true.len;
+                    } else if (std.mem.startsWith(u8, flag, string_false)) {
+                        v += string_false.len;
+                        json_value = true;
+                    } else if (std.mem.startsWith(u8, string_true, flag) or std.mem.startsWith(u8, string_false, flag)) return; // either flag yet
+                    if (v == rest.len) return;
+                    if (rest[v] != '>') {
+                        d.pos += ps + 1;
+                        continue;
+                    }
+                    const key = try json.quote(s.a, rest[ns..nq], .{ .ascii = false });
+                    try out.append(s.a, try s.args(try std.mem.concat(s.a, u8, &.{ if (d.args_open) "," else "{", key, if (json_value) ":" else ":\"" })));
+                    d.args_open = true;
+                    d.pos += v + 1;
+                    d.state = if (json_value) .json_value else .string_value;
+                },
+                .string_value, .json_value => {
+                    const value_end = reply_text.findTag(rest, 0, param41_close);
+                    // the invoke's closer before the value's: the parse drops the value, and the stream closes the call there
+                    const invoke_end = if (reply_text.findTag(rest, 0, invoke41_close)) |e| (if (value_end == null or e < value_end.?) e else null) else null;
+                    const end = invoke_end orelse value_end;
+                    var piece: []const u8 = undefined;
+                    if (d.state == .string_value) {
+                        const upto = end orelse rest.len - @max(reply_text.partialTag(rest, param41_close), reply_text.partialTag(rest, invoke41_close));
+                        piece = try s.esc(rest[0..upto]);
+                        if (end == null) {
+                            if (piece.len > 0) try out.append(s.a, try s.args(piece));
+                            d.pos += upto;
+                            return;
+                        }
+                        piece = try std.mem.concat(s.a, u8, &.{ piece, "\"" });
+                    } else {
+                        const raw = rest[0 .. end orelse return];
+                        const value: Value = switch (try json.parseText(s.a, raw)) {
+                            .ok => |parsed| parsed,
+                            .err => .{ .string = raw },
+                        };
+                        piece = try json.stringify(s.a, value, .{ .ascii = false, .compact = true });
+                    }
+                    if (invoke_end) |e| {
+                        try out.append(s.a, try s.args(try std.mem.concat(s.a, u8, &.{ piece, "}" })));
+                        d.pos += e + invoke41_close.len;
+                        d.state = .block;
+                        continue;
+                    }
+                    try out.append(s.a, try s.args(piece));
+                    d.pos += value_end.? + param41_close.len;
+                    d.state = .invoke;
+                },
+                .skip => {
+                    const e = reply_text.findTag(rest, 0, invoke41_close) orelse return;
+                    d.pos += e + invoke41_close.len;
+                    d.state = .block;
+                },
+            }
+        }
     }
 
     /// The deltas the reply's ``text`` (its whole answer so far) adds.
@@ -103,17 +255,7 @@ pub const Streamer = struct {
                         return;
                     };
                     s.current = name;
-                    s.index += 1;
-                    s.streamed = true;
-                    const function = try json.newObject(s.a);
-                    try function.put(s.a, "name", .{ .string = name });
-                    try function.put(s.a, "arguments", .{ .string = "" });
-                    const one = try json.newObject(s.a);
-                    try one.put(s.a, "index", try json.intValue(s.a, s.index));
-                    try one.put(s.a, "id", .{ .string = try ids.make(s.a, "call_", 24) });
-                    try one.put(s.a, "type", .{ .string = "function" });
-                    try one.put(s.a, "function", .{ .object = function });
-                    try out.append(s.a, try wrap(s.a, .{ .object = one }));
+                    try s.opened(name, out);
                     s.args_open = false;
                     s.pos += m.len;
                     s.state = .function;
@@ -401,4 +543,97 @@ fn sentArguments(a: Allocator, deltas: []const Value) Allocator.Error![]const u8
         try out.appendSlice(a, one.get("function").?.get("arguments").?.string);
     };
     return out.items;
+}
+
+/// The deltas a reply's calls send while its answer grows through ``text`` a character at a time, both forms fed as chat feeds them.
+fn answerStreamed(a: Allocator, tools: []const Value, text: []const u8) Allocator.Error![]Value {
+    var s = try Streamer.init(a, tools);
+    var out: std.ArrayList(Value) = .empty;
+    for (0..text.len + 1) |i| {
+        if (i < text.len and text[i] & 0xc0 == 0x80) continue; // whole characters, as a reply decodes
+        try s.feed(tool_parse.beforeDsml(text[0..i]), &out);
+        try s.feedDsml(text[0..i], &out);
+    }
+    return out.items;
+}
+
+/// Each streamed call as a client joins it: its name and arguments, by index.
+fn joinedCalls(a: Allocator, deltas: []const Value) Allocator.Error![][2][]const u8 {
+    var calls: std.ArrayList([2][]const u8) = .empty;
+    for (deltas) |d| for (d.get("tool_calls").?.array) |one| {
+        const i: usize = @intCast(one.get("index").?.int64().?);
+        const function = one.get("function").?;
+        if (i == calls.items.len) try calls.append(a, .{ function.get("name").?.string, "" });
+        calls.items[i][1] = try std.mem.concat(a, u8, &.{ calls.items[i][1], function.get("arguments").?.string });
+    };
+    return calls.items;
+}
+
+const dsml_tools = "[{\"type\":\"function\",\"function\":{\"name\":\"write\"}},{\"type\":\"function\",\"function\":{\"name\":\"Lookup\"}}]";
+const o41 = "<\u{ff5c}DSML\u{ff5c} ";
+const c41 = "</\u{ff5c}DSML\u{ff5c} ";
+const dsml_reply = "<tool_call>\n<function=lookup>\n<parameter=q>\nfirst\n</parameter>\n</function>\n</tool_call>\nThen the file.\n\n" ++
+    o41 ++ "calls>\n" ++
+    o41 ++ "invoke name=\"write\">\n" ++
+    o41 ++ "parameter name=\"filePath\" string=\"true\">src/a.py" ++ c41 ++ "parameter>\n" ++
+    o41 ++ "parameter name=\"content\" string=\"true\">def f(x):\n    return \"<b>\" + x  # \u{f1}, \u{6f22}\u{5b57}, \\ and </ tags\n" ++ c41 ++ "parameter>\n" ++
+    o41 ++ "parameter name=\"mode\" string=\"false\">{\"append\": false, \"n\": [1, 2.5]}" ++ c41 ++ "parameter>\n" ++
+    o41 ++ "parameter name=\"note\">plain" ++ c41 ++ "parameter>\n" ++
+    o41 ++ "parameter name=\"bad\" string=\"false\">not json" ++ c41 ++ "parameter>\n" ++
+    c41 ++ "invoke>\n" ++
+    o41 ++ "invoke name=\"lookup\">\n" ++ c41 ++ "invoke>\n" ++
+    o41 ++ "invoke name=\"launch\">\n" ++ o41 ++ "parameter name=\"when\" string=\"true\">now" ++ c41 ++ "parameter>\n" ++ c41 ++ "invoke>\n" ++
+    c41 ++ "calls>";
+
+test "DeepSeek-V4.1 calls stream their arguments as they are written and join to the parsed calls" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const tools = (try json.parse(a, dsml_tools)).ok.array;
+    const parsed = (try tool_parse.parse(a, dsml_reply, tools, null)).calls.?;
+    const got = try joinedCalls(a, try answerStreamed(a, tools, dsml_reply));
+    try std.testing.expectEqual(@as(usize, 4), parsed.len);
+    try std.testing.expectEqual(parsed.len, got.len);
+    for (parsed, got) |want, have| {
+        try std.testing.expectEqualStrings(want.get("function").?.get("name").?.string, have[0]);
+        try std.testing.expectEqualStrings(want.get("function").?.get("arguments").?.string, have[1]);
+    }
+    // the content goes out before its closer is written
+    const cut = std.mem.indexOf(u8, dsml_reply, "return").? + "return".len;
+    const early = try joinedCalls(a, try answerStreamed(a, tools, dsml_reply[0..cut]));
+    try std.testing.expectEqual(@as(usize, 2), early.len);
+    try std.testing.expectEqualStrings("write", early[1][0]);
+    try std.testing.expectEqualStrings("{\"filePath\":\"src/a.py\",\"content\":\"def f(x):\\n    return", early[1][1]);
+}
+
+test "a DeepSeek-V4.1 call the reply's length cuts off stays open" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const tools = (try json.parse(a, dsml_tools)).ok.array;
+    const cut = dsml_reply[0 .. std.mem.indexOf(u8, dsml_reply, "+ x").? + 1];
+    try std.testing.expect((try tool_parse.parse(a, cut, tools, null)).calls.?.len == 1); // the XML call alone
+    const got = try joinedCalls(a, try answerStreamed(a, tools, cut));
+    try std.testing.expectEqual(@as(usize, 2), got.len);
+    try std.testing.expect(try json.parseText(a, got[1][1]) == .err);
+    // a closer written partway is held, not sent as text
+    const partial = try std.mem.concat(a, u8, &.{ cut, "\n", c41[0..5] });
+    const held = try joinedCalls(a, try answerStreamed(a, tools, partial));
+    try std.testing.expectEqualStrings(try std.mem.concat(a, u8, &.{ got[1][1], "\\n" }), held[1][1]);
+}
+
+test "a DeepSeek-V4.1 value its invoke closes ends that call, and the next call streams" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const tools = (try json.parse(a, dsml_tools)).ok.array;
+    const text = o41 ++ "calls>\n" ++ o41 ++ "invoke name=\"write\">\n" ++ o41 ++ "parameter name=\"c\" string=\"true\">a" ++ c41 ++ "invoke>\n" ++
+        o41 ++ "invoke name=\"Lookup\">\n" ++ o41 ++ "parameter name=\"n\" string=\"false\">5" ++ c41 ++ "parameter>\n" ++ c41 ++ "invoke>\n" ++ c41 ++ "calls>";
+    const parsed = (try tool_parse.parse(a, text, tools, null)).calls.?;
+    const got = try joinedCalls(a, try answerStreamed(a, tools, text));
+    try std.testing.expectEqual(@as(usize, 2), got.len);
+    // the parse drops the unclosed value; the stream had sent it, and closes the call around it
+    try std.testing.expectEqualStrings("{}", parsed[0].get("function").?.get("arguments").?.string);
+    try std.testing.expectEqualStrings("{\"c\":\"a\"}", got[0][1]);
+    try std.testing.expectEqualStrings(parsed[1].get("function").?.get("arguments").?.string, got[1][1]);
 }

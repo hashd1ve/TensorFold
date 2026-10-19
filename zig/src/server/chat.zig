@@ -402,6 +402,7 @@ const Generation = struct {
         if (g.calls) |*c| {
             var out: std.ArrayList(Value) = .empty;
             try c.feed(tool_parse.beforeDsml(answer), &out); // never the reasoning, nor a DSML block's arguments: a call they quote is not made
+            try c.feedDsml(answer, &out); // the DSML calls themselves, their arguments as they are written
             for (out.items) |d| try g.emit(sink, d);
         }
     }
