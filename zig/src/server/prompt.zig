@@ -52,43 +52,74 @@ pub fn prepare(srv: *Server, cx: *Cx, input: chat.Input, thinking: bool, effort:
         } },
         .ids => |ids| return .{ .ids = ids },
     };
-    const prompt = try renderIds(srv, cx, input.messages, input.tools, thinking, effort, true);
-    const history = try renderIds(srv, cx, input.messages, input.tools, thinking, effort, false);
+    // both renders in a scratch arena freed here: the request keeps only the ids for as long as its reply runs, not
+    // the template's values and the text of two renders of the whole conversation
+    var arena: std.heap.ArenaAllocator = .init(srv.gpa);
+    defer arena.deinit();
+    var scratch: Cx = .{ .a = arena.allocator() };
+    const rendered = renderIds(srv, &scratch, input.messages, input.tools, thinking, effort, true) catch |e| return carry(cx, &scratch, e);
+    const history = renderIds(srv, &scratch, input.messages, input.tools, thinking, effort, false) catch |e| return carry(cx, &scratch, e);
     var history_len: usize = 0;
-    if (history.len > 0 and history.len < prompt.len and std.mem.eql(u32, prompt[0..history.len], history)) history_len = history.len;
-    if (history_len == 0 and prompt.len > 1 and std.mem.eql(u32, history, prompt)) history_len = prompt.len - 1; // a template with no generation suffix
-    if (input.images.len > 0) return spans(srv, cx, prompt, history_len, input.images);
-    return .{ .ids = prompt, .history_len = history_len };
+    if (history.len > 0 and history.len < rendered.len and std.mem.eql(u32, rendered[0..history.len], history)) history_len = history.len;
+    if (history_len == 0 and rendered.len > 1 and std.mem.eql(u32, history, rendered)) history_len = rendered.len - 1; // a template with no generation suffix
+    if (input.images.len > 0) return spans(srv, cx, rendered, history_len, input.images);
+    return .{ .ids = try cx.a.dupe(u32, rendered), .history_len = history_len };
+}
+
+/// A refusal from a scratch context, its message moved to the request's allocator before the scratch is freed.
+fn carry(cx: *Cx, scratch: *const Cx, e: errors.Refused) errors.Refused {
+    if (e == error.Refused) {
+        cx.kind = scratch.kind;
+        cx.message = try cx.a.dupe(u8, scratch.message);
+    }
+    return e;
 }
 
 /// Each image placeholder of the rendered prompt as its image's span (the vision family's prepare: the span's length and
-/// the payload the engine reads), the images in prompt order.
+/// the payload the engine reads), the images in prompt order. Each prepare runs in a scratch arena reset for the next
+/// image (a decode's pixels and patches are tens of MB): the request keeps only the payloads, and the ids and key at
+/// their final length.
 fn spans(srv: *Server, cx: *Cx, ids: []const u32, history_len: usize, images: []const []const u8) errors.Refused!Rendered {
     const vision = srv.info.vision orelse return cx.refuse("this server accepts text only; image, audio and video inputs are unsupported");
-    var out: std.ArrayList(u32) = .empty;
-    var key: std.ArrayList(u32) = .empty;
-    var placed: std.ArrayList(api.Image) = .empty;
+    const holders = std.mem.count(u32, ids, &.{vision.token});
+    const placed = try cx.a.alloc(api.Image, @min(holders, images.len));
+    var total = ids.len;
+    {
+        var arena: std.heap.ArenaAllocator = .init(srv.gpa);
+        defer arena.deinit();
+        for (placed, images[0..placed.len]) |*p, bytes| {
+            _ = arena.reset(.retain_capacity);
+            var problem: []const u8 = "";
+            const prep = vision.prepare(vision.ctx, arena.allocator(), bytes, &problem) catch |e| switch (e) {
+                error.OutOfMemory => return error.OutOfMemory,
+                error.BadImage => return cx.refuse(try cx.a.dupe(u8, problem)),
+            };
+            const payload = try cx.a.alignedAlloc(u8, .@"16", prep.payload.len);
+            @memcpy(payload, prep.payload);
+            p.* = .{ .at = 0, .tokens = prep.tokens, .bytes = payload };
+            total += prep.tokens - 1;
+        }
+    }
+    if (holders > images.len) return cx.refuse("image input: the prompt holds more image placeholders than images");
+    if (holders < images.len) return cx.refuse("image input: the prompt holds fewer image placeholders than images");
+    var out: std.ArrayList(u32) = try .initCapacity(cx.a, total);
+    var key: std.ArrayList(u32) = try .initCapacity(cx.a, total);
     var history_extra: usize = 0;
+    var k: usize = 0;
     for (ids, 0..) |id, i| {
         if (id != vision.token) {
-            try out.append(cx.a, id);
-            try key.append(cx.a, id);
+            out.appendAssumeCapacity(id);
+            key.appendAssumeCapacity(id);
             continue;
         }
-        const k = placed.items.len;
-        if (k >= images.len) return cx.refuse("image input: the prompt holds more image placeholders than images");
-        var problem: []const u8 = "";
-        const prep = vision.prepare(vision.ctx, cx.a, images[k], &problem) catch |e| switch (e) {
-            error.OutOfMemory => return error.OutOfMemory,
-            error.BadImage => return cx.refuse(problem),
-        };
-        try placed.append(cx.a, .{ .at = @intCast(out.items.len), .tokens = prep.tokens, .bytes = prep.payload });
-        try out.appendNTimes(cx.a, vision.token, prep.tokens);
-        try spellImage(cx.a, &key, prep.payload, prep.tokens);
-        if (i < history_len) history_extra += prep.tokens - 1;
+        const p = &placed[k];
+        k += 1;
+        p.at = @intCast(out.items.len);
+        out.appendNTimesAssumeCapacity(vision.token, p.tokens);
+        try spellImage(cx.a, &key, p.bytes, p.tokens);
+        if (i < history_len) history_extra += p.tokens - 1;
     }
-    if (placed.items.len != images.len) return cx.refuse("image input: the prompt holds fewer image placeholders than images");
-    return .{ .ids = out.items, .images = placed.items, .cache_key = key.items, .history_len = if (history_len > 0) history_len + history_extra else 0 };
+    return .{ .ids = out.items, .images = placed, .cache_key = key.items, .history_len = if (history_len > 0) history_len + history_extra else 0 };
 }
 
 /// An image span as the cache key spells it: ids past every vocabulary's, one a position, from the payload's digest.
