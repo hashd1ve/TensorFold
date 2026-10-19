@@ -113,6 +113,8 @@ pub const Tokenizer = struct {
     }
 
     /// Token ids for `text`, without post-processor tokens; invalid UTF-8 reads as U+FFFD. Caller frees with `a`.
+    /// Scratch is reused from one added-token segment and one word to the next, so a long prompt costs about its ids
+    /// and its longest segment's pieces, not every piece of every step (~800 bytes a token, kept until the call ends).
     pub fn encode(t: *const Tokenizer, a: Allocator, text: []const u8) Error![]u32 {
         var arena = std.heap.ArenaAllocator.init(a);
         defer arena.deinit();
@@ -123,26 +125,40 @@ pub const Tokenizer = struct {
             try unicode.appendLossy(&fixed, ctx.a, text);
             valid = fixed.items;
         }
+        var segment = std.heap.ArenaAllocator.init(a);
+        defer segment.deinit();
+        var word = std.heap.ArenaAllocator.init(a);
+        defer word.deinit();
         var ids: std.ArrayList(u32) = .empty;
+        errdefer ids.deinit(a);
         for (try t.splitAdded(&ctx, &t.raw, valid)) |seg| {
-            if (seg.id) |id| try ids.append(ctx.a, id) else if (seg.end > seg.start) try t.encodeText(&ctx, valid[seg.start..seg.end], seg.start == 0, &ids);
+            if (seg.id) |id| try ids.append(a, id) else if (seg.end > seg.start) try t.encodeText(&segment, &word, a, valid[seg.start..seg.end], seg.start == 0, &ids);
         }
-        return a.dupe(u32, ids.items);
+        return ids.toOwnedSlice(a);
     }
 
-    fn encodeText(t: *const Tokenizer, ctx: *steps.Context, text: []const u8, first: bool, ids: *std.ArrayList(u32)) Error!void {
+    /// One added-token segment's ids appended to `ids` (from `a`); `segment` and `word` are reset for each.
+    fn encodeText(t: *const Tokenizer, segment: *std.heap.ArenaAllocator, word: *std.heap.ArenaAllocator, a: Allocator, text: []const u8, first: bool, ids: *std.ArrayList(u32)) Error!void {
+        _ = segment.reset(.retain_capacity);
+        var ctx = steps.Context{ .a = segment.allocator(), .matcher = .{ .a = segment.allocator() } };
         var zero: usize = if (first) unicode.decodeAt(text, 0).len else 0;
-        const normalized = if (t.normalizer) |*n| try n.apply(ctx, text, &zero) else text;
-        for (try t.splitAdded(ctx, &t.normalized, normalized)) |seg| {
+        const normalized = if (t.normalizer) |*n| try n.apply(&ctx, text, &zero) else text;
+        for (try t.splitAdded(&ctx, &t.normalized, normalized)) |seg| {
             if (seg.id) |id| {
-                try ids.append(ctx.a, id);
+                try ids.append(a, id);
                 continue;
             }
             if (seg.end == seg.start) continue;
             var pieces: std.ArrayList(steps.Piece) = .empty;
             try pieces.append(ctx.a, .{ .text = normalized[seg.start..seg.end], .first = seg.start < zero });
-            if (t.pre_tokenizer) |*p| try p.apply(ctx, &pieces);
-            for (pieces.items) |piece| try t.model.tokenize(ctx, &t.vocab, piece.text, ids);
+            if (t.pre_tokenizer) |*p| try p.apply(&ctx, &pieces);
+            for (pieces.items) |piece| {
+                _ = word.reset(.retain_capacity);
+                var word_ctx = steps.Context{ .a = word.allocator(), .matcher = .{ .a = word.allocator() } };
+                var word_ids: std.ArrayList(u32) = .empty;
+                try t.model.tokenize(&word_ctx, &t.vocab, piece.text, &word_ids);
+                try ids.appendSlice(a, word_ids.items);
+            }
         }
     }
 
@@ -362,4 +378,28 @@ test "without a decoder, decode joins known ids' tokens with spaces" {
     defer a.free(text);
     try std.testing.expectEqualStrings("t1 t4", text);
     try std.testing.expectEqual(@as(?u32, null), t.unk_id);
+}
+
+test "a long text costs about its ids, even through an arena that frees nothing until the end" {
+    const json =
+        \\{"added_tokens":[{"id":7,"content":"<|end|>","single_word":false,"lstrip":false,"rstrip":false,"normalized":false,"special":true}],
+        \\ "pre_tokenizer":{"type":"Sequence","pretokenizers":[{"type":"Split","pattern":{"Regex":" ?\\S+|\\s+"},"behavior":"Isolated","invert":false},{"type":"ByteLevel","add_prefix_space":false,"trim_offsets":false,"use_regex":false}]},
+        \\ "model":{"type":"BPE","dropout":null,"unk_token":null,"continuing_subword_prefix":"","end_of_word_suffix":"","fuse_unk":false,"byte_fallback":false,"ignore_merges":false,
+        \\  "vocab":{"a":0,"b":1,"Ġ":2,"ab":3,"Ġa":4,"Ġab":5,"c":6},"merges":[["Ġ","a"],"a b","Ġa b"]}}
+    ;
+    const a = std.testing.allocator;
+    var t = try parse(a, json);
+    defer t.deinit();
+    var text: std.ArrayList(u8) = .empty;
+    defer text.deinit(a);
+    for (0..400) |_| {
+        for (0..50) |_| try text.appendSlice(a, "ab ab c ");
+        try text.appendSlice(a, "<|end|>");
+    }
+    var arena: std.heap.ArenaAllocator = .init(a); // a server request's allocator: nothing comes back before it ends
+    defer arena.deinit();
+    const ids = try t.encode(arena.allocator(), text.items);
+    try std.testing.expect(ids.len > 60000);
+    // every step's pieces of every word, kept to the end, cost hundreds of bytes a token
+    try std.testing.expect(arena.queryCapacity() < 32 * ids.len);
 }
