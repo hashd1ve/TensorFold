@@ -140,14 +140,43 @@ test "DeepSeek-V4.1's DSML calls, read as the served lane reads them" {
     // JSON that does not parse is the string; no string attribute is a string
     const loose = "<" ++ D ++ " calls><" ++ D ++ " invoke name=\"weather\"><" ++ D ++ " parameter name=\"x\" string=\"false\">not json</" ++ D ++ " parameter><" ++ D ++ " parameter name=\"y\">7</" ++ D ++ " parameter></" ++ D ++ " invoke></" ++ D ++ " calls>";
     try std.testing.expectEqualStrings("{\"x\":\"not json\",\"y\":\"7\"}", (try parse(a, loose, tools, null)).calls.?[0].get("function").?.get("arguments").?.string);
-    // a tool the request did not offer: the lane's rewritten block stays the reply's text
+    // a tool the request did not offer is a call under the model's name, for the client to answer; one call a reply drops it
     const other = "<" ++ D ++ " calls>\n<" ++ D ++ " invoke name=\"launch\">\n<" ++ D ++ " parameter name=\"when\" string=\"true\">now</" ++ D ++ " parameter>\n</" ++ D ++ " invoke>\n</" ++ D ++ " calls>";
     const kept = try parse(a, other, tools, null);
-    try std.testing.expect(kept.calls == null);
-    try std.testing.expectEqualStrings("<tool_call>{\"name\": \"launch\", \"arguments\": {\"when\": \"now\"}}</tool_call>", kept.content);
-    try std.testing.expectEqualStrings("", (try parse(a, other, tools, 1)).content);
+    try std.testing.expectEqualStrings("", kept.content);
+    try std.testing.expectEqual(@as(usize, 1), kept.calls.?.len);
+    try std.testing.expectEqualStrings("launch", kept.calls.?[0].get("function").?.get("name").?.string);
+    try std.testing.expectEqualStrings("{\"when\":\"now\"}", kept.calls.?[0].get("function").?.get("arguments").?.string);
+    const one = try parse(a, other, tools, 1);
+    try std.testing.expectEqualStrings("", one.content);
+    try std.testing.expect(one.calls == null);
     // a block with no invoke goes; an unclosed block stays text
     try std.testing.expectEqualStrings("Hi.", (try parse(a, "Hi.<" ++ D ++ " calls>\n</" ++ D ++ " calls>", tools, null)).content);
     const open = "Hi.<" ++ D ++ " calls>\n<" ++ D ++ " invoke name=\"weather\">";
     try std.testing.expectEqualStrings(open, (try parse(a, open, tools, null)).content);
+}
+
+test "a DSML block is read from its own tags: <tool_call> text around it or in an argument moves nothing" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const tools = (try json.parse(a, "[{\"type\":\"function\",\"function\":{\"name\":\"weather\"}},{\"type\":\"function\",\"function\":{\"name\":\"write\"}}]")).ok.array;
+    const D = "\u{ff5c}DSML\u{ff5c}";
+    const quoted = "a </tool_call> and <tool_call>{\"name\": \"weather\", \"arguments\": {}}</tool_call>";
+    const block = "<" ++ D ++ " calls>\n<" ++ D ++ " invoke name=\"write\">\n<" ++ D ++ " parameter name=\"content\" string=\"true\">" ++ quoted ++ "</" ++ D ++ " parameter>\n</" ++ D ++ " invoke>\n</" ++ D ++ " calls>";
+    // a <tool_call> in the prose before the block, and a </tool_call> and a whole call in its argument
+    const r = try parse(a, "I will not use <tool_call> here.\n\n" ++ block, tools, null);
+    try std.testing.expectEqualStrings("I will not use <tool_call> here.", r.content);
+    try std.testing.expectEqual(@as(usize, 1), r.calls.?.len);
+    try std.testing.expectEqualStrings("write", r.calls.?[0].get("function").?.get("name").?.string);
+    const args = (try json.parse(a, r.calls.?[0].get("function").?.get("arguments").?.string)).ok;
+    try std.testing.expectEqualStrings(quoted, args.get("content").?.string);
+    // calls keep the reply's order: a <tool_call> call before the block comes first
+    const both = try parse(a, "<tool_call>{\"name\": \"weather\", \"arguments\": {\"city\": \"Oslo\"}}</tool_call>\n" ++ block, tools, null);
+    try std.testing.expectEqual(@as(usize, 2), both.calls.?.len);
+    try std.testing.expectEqualStrings("weather", both.calls.?[0].get("function").?.get("name").?.string);
+    try std.testing.expectEqualStrings("write", both.calls.?[1].get("function").?.get("name").?.string);
+    // the call streamer reads only the text before the first block
+    try std.testing.expectEqualStrings("Hi. ", tool_parse.beforeDsml("Hi. " ++ block ++ " more"));
+    try std.testing.expectEqualStrings("no block", tool_parse.beforeDsml("no block"));
 }
