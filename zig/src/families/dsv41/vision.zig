@@ -12,20 +12,29 @@ const model = @import("model.zig");
 const pil = @import("pil.zig");
 
 /// A prepared image's payload: its grid (six u32, little-endian: best_h, best_w, n_vit_h, n_vit_w, n_llm_h, n_llm_w)
-/// then its patches (bf16, picture.patchify's order), the patches 16-byte aligned.
+/// then its patches (bf16, picture.patchify's order), the patches 16-byte aligned. A PNG's payload holds the file in
+/// place of the patches (a seventh u32, `png_file`, says so): `rows` decodes it when a prompt pass reads its span, so a
+/// request that sends a conversation's screenshots again decodes none of the ones its kept state already holds.
 const header_bytes = 32;
+const png_file: u32 = 1;
+
+/// PNGs whose decode already succeeded here (their bytes' Wyhash): a PNG seen once is sized from its header after.
+const checked_max = 4096;
 
 /// The span a picture can take at most (picture.Config.max_tokens aligner rows, a newline each row, the delimiters).
 const max_span = 4096;
 
 pub const Vision = struct {
     gpa: std.mem.Allocator,
+    io: std.Io,
     m: *model.Model,
     cfg: picture.Config = .{},
     tower: vit.Tower,
     span: cuda.DeviceBuffer, // bf16 [max_span, 5120]: a picture's span rows
     scratch: cuda.DeviceBuffer, // the span's types and rows (Tower.spanRows)
     pil: ?*pil.Pil = null, // the formats picture.zig does not decode (null: no python3 with Pillow here)
+    checked: std.AutoHashMapUnmanaged(u64, void) = .empty, // under `checked_mutex`: requests prepare on their threads
+    checked_mutex: std.Io.Mutex = .init,
 
     /// The tower on `m`'s stream (its exact kernels and cuBLAS handle, as the tower gate ran them), its weights from
     /// the checkpoint, torch's attention cubin from the kit's vision/, and its workspace for the largest picture.
@@ -37,7 +46,7 @@ pub const Vision = struct {
         if (m.w.layers.len == 0 or m.w.layers[0].gate_b_vl == 0) return error.NoVisionKit; // (model.zig loads the bias)
         const v = try gpa.create(Vision);
         errdefer gpa.destroy(v);
-        v.* = .{ .gpa = gpa, .m = m, .tower = undefined, .span = undefined, .scratch = undefined };
+        v.* = .{ .gpa = gpa, .io = io, .m = m, .tower = undefined, .span = undefined, .scratch = undefined };
         const d = m.ctx.d;
         v.tower = try vit.Tower.open(gpa, io, d, m.stream, model_dir, cubin, cuda.kernels.dsv41_ops, &m.ex, &m.blas, m.ch.blas_ws);
         errdefer v.tower.close();
@@ -56,6 +65,7 @@ pub const Vision = struct {
 
     pub fn close(v: *Vision) void {
         if (v.pil) |p| p.stop(v.gpa);
+        v.checked.deinit(v.gpa);
         v.scratch.free();
         v.span.free();
         v.tower.close();
@@ -71,6 +81,21 @@ pub const Vision = struct {
 
     fn prepareFn(ctx: *anyopaque, a: std.mem.Allocator, bytes: []const u8, problem: *[]const u8) lanes.stream.Vision.PrepareError!lanes.stream.Vision.Prepared {
         const v: *Vision = @ptrCast(@alignCast(ctx));
+        if (picture.pixels(bytes) != null) {
+            // a PNG: decoded the first time it comes (a bad one is refused as ever), then sized from its header; the
+            // payload carries the file, which `rows` decodes if a prompt pass needs the span
+            const digest = std.hash.Wyhash.hash(0, bytes);
+            if (!v.wasChecked(digest)) {
+                var rgb = try v.decode(a, bytes, problem);
+                rgb.deinit(a);
+                try v.check(digest);
+            }
+            const g = picture.plan(std.mem.readInt(u32, bytes[16..20], .big), std.mem.readInt(u32, bytes[20..24], .big), v.cfg);
+            const payload = try a.alignedAlloc(u8, .@"16", header_bytes + bytes.len);
+            writeHeader(payload, g, png_file);
+            @memcpy(payload[header_bytes..], bytes);
+            return .{ .tokens = @intCast(g.spanTokens()), .payload = payload };
+        }
         var rgb = try v.decode(a, bytes, problem);
         defer rgb.deinit(a);
         var pic = picture.fromRgb(a, rgb, v.cfg) catch |err| {
@@ -81,10 +106,27 @@ pub const Vision = struct {
         defer pic.deinit(a);
         const g = pic.grid;
         const payload = try a.alignedAlloc(u8, .@"16", header_bytes + pic.patches.len * 2);
-        @memset(payload[0..header_bytes], 0);
-        for ([_]usize{ g.best_h, g.best_w, g.n_vit_h, g.n_vit_w, g.n_llm_h, g.n_llm_w }, 0..) |x, i| std.mem.writeInt(u32, payload[i * 4 ..][0..4], @intCast(x), .little);
+        writeHeader(payload, g, 0);
         @memcpy(payload[header_bytes..], std.mem.sliceAsBytes(pic.patches));
         return .{ .tokens = @intCast(g.spanTokens()), .payload = payload };
+    }
+
+    fn writeHeader(payload: []u8, g: picture.Grid, kind: u32) void {
+        @memset(payload[0..header_bytes], 0);
+        for ([_]usize{ g.best_h, g.best_w, g.n_vit_h, g.n_vit_w, g.n_llm_h, g.n_llm_w, kind }, 0..) |x, i| std.mem.writeInt(u32, payload[i * 4 ..][0..4], @intCast(x), .little);
+    }
+
+    fn wasChecked(v: *Vision, digest: u64) bool {
+        v.checked_mutex.lockUncancelable(v.io);
+        defer v.checked_mutex.unlock(v.io);
+        return v.checked.contains(digest);
+    }
+
+    fn check(v: *Vision, digest: u64) error{OutOfMemory}!void {
+        v.checked_mutex.lockUncancelable(v.io);
+        defer v.checked_mutex.unlock(v.io);
+        if (v.checked.count() >= checked_max) v.checked.clearRetainingCapacity();
+        try v.checked.put(v.gpa, digest, {});
     }
 
     /// The image's RGB as the lane's Pillow decodes it: picture.zig's PNG, else Pillow's own (the refusal in the lane's
@@ -118,16 +160,31 @@ pub const Vision = struct {
     }
 
     /// A prepared picture's span rows bf16 [tokens, 5120] appended to `out` (the tower on the model's stream, then the
-    /// rows to the host); its span's tokens.
+    /// rows to the host); its span's tokens. A PNG's payload is decoded and cut into its patches here.
     pub fn rows(v: *Vision, payload: []const u8, gpa: std.mem.Allocator, out: *std.ArrayList(u8)) !usize {
         if (payload.len < header_bytes) return error.BadImagePayload;
-        var x: [6]usize = undefined;
+        var x: [7]usize = undefined;
         for (&x, 0..) |*f, i| f.* = std.mem.readInt(u32, payload[i * 4 ..][0..4], .little);
         const g: picture.Grid = .{ .best_h = x[0], .best_w = x[1], .n_vit_h = x[2], .n_vit_w = x[3], .n_llm_h = x[4], .n_llm_w = x[5] };
         const n = g.patches();
-        if (payload.len != header_bytes + n * vit.patch_in * 2 or g.spanTokens() > max_span) return error.BadImagePayload;
-        const body: []align(2) const u8 = @alignCast(payload[header_bytes..]);
-        const patches = std.mem.bytesAsSlice(u16, body);
+        if (g.spanTokens() > max_span) return error.BadImagePayload;
+        var arena: std.heap.ArenaAllocator = .init(gpa); // a PNG's pixels and patches, until the tower has read them
+        defer arena.deinit();
+        const patches: []const u16 = switch (x[6]) {
+            0 => blk: {
+                if (payload.len != header_bytes + n * vit.patch_in * 2) return error.BadImagePayload;
+                const body: []align(2) const u8 = @alignCast(payload[header_bytes..]);
+                break :blk std.mem.bytesAsSlice(u16, body);
+            },
+            png_file => blk: {
+                var problem: []const u8 = "";
+                const rgb = v.decode(arena.allocator(), payload[header_bytes..], &problem) catch |err| return if (err == error.OutOfMemory) err else error.BadImagePayload;
+                const pic = try picture.fromRgb(arena.allocator(), rgb, v.cfg);
+                if (!std.meta.eql(pic.grid, g)) return error.BadImagePayload;
+                break :blk pic.patches;
+            },
+            else => return error.BadImagePayload,
+        };
         const at = try v.tower.encode(g, patches, null);
         try v.tower.spanRows(g, at, v.span.ptr, v.scratch.ptr);
         const t = g.spanTokens();
