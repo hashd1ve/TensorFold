@@ -37,6 +37,7 @@ test {
     _ = @import("messages.zig");
     _ = @import("stream_preflight_test.zig");
     _ = @import("literal_tokens_test.zig");
+    _ = @import("think_split_test.zig");
     _ = @import("late_system_test.zig");
     _ = @import("prompt_memory_test.zig");
     _ = @import("effort_values_test.zig");

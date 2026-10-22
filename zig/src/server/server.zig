@@ -63,6 +63,7 @@ pub const Server = struct {
     late_system: []const u8 = "system",
     needs_user_after_tool: bool = false,
     markers: reply_text.Markers = reply_text.think_markers,
+    close_id: ?u32 = null, // the close marker's own token, when the marker is one token
     chunks: chunk_plan.Plan = .{},
     effort_levels: []const []const u8 = &.{},
     /// The engine's numbers for its efforts (Info.efforts); empty: the template hears the names.
@@ -93,6 +94,7 @@ pub const Server = struct {
         const a = srv.arena.allocator();
         srv.eos = try a.dupe(u32, text.eosIds());
         if (text.tokenId(reply_text.channel_markers.close) != null) srv.markers = reply_text.channel_markers;
+        srv.close_id = text.tokenId(srv.markers.close);
         if (srv.info.efforts.len > 0) {
             // a family whose template takes numbers: every name it gives one passes as asked, rendered as that number
             const names = try a.alloc([]const u8, srv.info.efforts.len);
