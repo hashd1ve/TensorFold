@@ -24,7 +24,7 @@ const Text = struct {
     close_token: bool = true, // false: the close marker is not a token, so the text's spelling is what closes
 
     fn text(t: *@This()) model_text.Text {
-        return .{ .ctx = t, .vtable = &.{ .encode = encode, .decode = decode, .token_id = tokenId, .token_string = tokenString, .vocab_size = vocabSize, .eos_ids = eosIds, .render = render, .template_source = templateSource, .token_bytes = tokenBytes } };
+        return .{ .ctx = t, .vtable = &.{ .encode = encode, .decode = decode, .token_id = tokenId, .token_string = tokenString, .vocab_size = vocabSize, .eos_ids = eosIds, .render = render, .template_source = templateSource } };
     }
 
     /// The close marker is one token; the quoted tag is three, so the text spells the same and the tokens differ.
@@ -51,12 +51,6 @@ const Text = struct {
         return out.items;
     }
 
-    fn tokenBytes(ctx: *anyopaque, a: std.mem.Allocator, id: u32) std.mem.Allocator.Error!?[]u8 {
-        const t: *Text = @ptrCast(@alignCast(ctx));
-        if (t.real != null) return null;
-        return try a.dupe(u8, piece(id));
-    }
-
     fn tokenId(ctx: *anyopaque, p: []const u8) ?u32 {
         const t: *Text = @ptrCast(@alignCast(ctx));
         if (t.real) |tok| return tok.specialTokenId(p);
@@ -76,8 +70,8 @@ const Text = struct {
         return &.{eos};
     }
 
-    fn render(_: *anyopaque, a: std.mem.Allocator, _: json.Value, _: model_text.RenderOptions, _: *[]const u8) model_text.Error!model_text.Rendered {
-        return .{ .text = try (a.dupe(u8, "prompt")) };
+    fn render(_: *anyopaque, a: std.mem.Allocator, _: json.Value, _: model_text.RenderOptions, _: *[]const u8) model_text.Error![]u8 {
+        return a.dupe(u8, "prompt");
     }
 
     fn templateSource(_: *anyopaque) []const u8 {
@@ -139,7 +133,7 @@ const Got = struct {
         g.events.deinit(std.testing.allocator);
     }
 
-    fn open(_: *anyopaque, _: usize) error{Closed}!void {}
+    fn open(_: *anyopaque) error{Closed}!void {}
 
     fn event(ctx: *anyopaque, payload: ?json.Value) error{Closed}!void {
         const g: *Got = @ptrCast(@alignCast(ctx));
