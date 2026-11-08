@@ -13,7 +13,7 @@ const cuda = @import("cuda");
 const dsv41 = @import("dsv41");
 const lanes = @import("lanes");
 
-const usage = "usage: tf-dsv41-lanes MODEL_DIR CACHE_DIR RANK WORLD MASTER_IP PORT KIT_DIR --requests FILE [--parallel N] [--pool P] [--drafts 0|1] [--arena-gib G] [--engram DIR --token-map FILE] [--rdma DEVICES --rdma-kernels FATBIN] [--fix-k K] [--round-rows R] [--streams S]\n";
+const usage = "usage: tf-dsv41-lanes MODEL_DIR CACHE_DIR RANK WORLD MASTER_IP PORT KIT_DIR --requests FILE [--parallel N] [--pool P] [--drafts 0|1] [--arena-gib G] [--engram DIR --token-map FILE] [--rdma DEVICES --rdma-kernels FATBIN] [--graphs 0|1 [--graph-cap N]] [--fix-k K] [--round-rows R] [--streams S]\n";
 
 const Request = struct {
     name: []const u8 = "",
@@ -95,6 +95,8 @@ pub fn main(init: std.process.Init) !u8 {
             o.side = !std.mem.eql(u8, val, "0");
         } else if (std.mem.eql(u8, key, "--graphs")) {
             o.graphs = !std.mem.eql(u8, val, "0");
+        } else if (std.mem.eql(u8, key, "--graph-cap")) {
+            o.graph_cap = try std.fmt.parseInt(usize, val, 10);
         } else if (std.mem.eql(u8, key, "--serial")) {
             serial = !std.mem.eql(u8, val, "0");
         } else if (std.mem.eql(u8, key, "--fix-k")) {
