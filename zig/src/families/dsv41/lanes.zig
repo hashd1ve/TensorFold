@@ -475,7 +475,7 @@ pub const Lanes = struct {
                 try self.wire.int(self.gpa, u64, f.replay);
                 try self.flush();
             }
-            f.head = try m.fillChunk(seq[0 .. start + n], start, n, f.replay);
+            f.head = m.fillChunk(seq[0 .. start + n], start, n, f.replay) catch |err| return endOnRankFault(err);
             f.start += n;
             if (s.reuse.hook) |k| if (f.start < len and f.start <= f.replay and (f.start == f.last_end or markEnds(s.reuse.marks, f.start))) k.at(k.ptr, s, @intCast(f.start));
         }
@@ -955,6 +955,17 @@ fn refused(err: anyerror) void {
     std.debug.print("{{\"follow_refused\": \"{s}\"}}\n", .{@errorName(err)});
 }
 
+/// A prompt chunk's Engram rows this rank could not read (prompt.rankFault): the peer waits for them in the layer's
+/// collective, and this branch has no way to end the pair from the host. The rank exits with status 75, and the
+/// supervisor (ops/keep_serving.sh: either rank down) restarts both; any other error comes back as it was.
+fn endOnRankFault(err: anyerror) anyerror {
+    if (err == error.EngramRankFault) {
+        std.log.err("dsv41: a prompt chunk's Engram rows could not be read on this rank: exiting 75 so that both ranks restart", .{});
+        std.process.exit(75);
+    }
+    return err;
+}
+
 /// A follower's verify times with Model.prof (a profile on ranks 1-3: rounds, issue and wall ns summed).
 pub var follow_prof: struct { rounds: u64 = 0, enqueue: u64 = 0, forward: u64 = 0 } = .{};
 
@@ -1031,7 +1042,7 @@ pub fn follow(gpa: std.mem.Allocator, m: *Model) !void {
                 const replay: usize = @intCast(try r.int(u64));
                 if (start + n > seqs[slot].items.len) return error.BadChunk;
                 if (m.fill_seq.len == 0) m.fill_seq = seqs[slot].items; // a piece after a round: the read-ahead again
-                _ = m.fillChunk(seqs[slot].items[0 .. start + n], start, n, replay) catch |err| refused(err);
+                _ = m.fillChunk(seqs[slot].items[0 .. start + n], start, n, replay) catch |err| refused(endOnRankFault(err));
             },
             .verify => {
                 const nw = try r.int(u32);
