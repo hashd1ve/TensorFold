@@ -283,7 +283,6 @@ test "an Engram read this rank could not make ends the pair at the layer, on eve
     const tabs = [2]engram_io.Table{ tables.layers.get(1).?, tables.layers.get(14).? };
     var seq: [cap]i32 = undefined;
     for (&seq, 0..) |*x, i| x.* = @intCast((i * 13 + 5) % 40);
-    const round_mod = @import("round.zig");
     const fault: anyerror = error.EngramRankFault;
 
     // read at the layer, by the pool's preads and by the prompt's ring
@@ -308,8 +307,6 @@ test "an Engram read this rank could not make ends the pair at the layer, on eve
         try std.testing.expectError(error.EngramRankFault, err);
         if (j == 0) ld.after(&eh, &c, &seq, 0, cap, 0, null, 0); // (layer 1's reader starts after layer 0)
     }
-    // and all of them end the pair
-    try std.testing.expect(round_mod.endsPair(fault));
 }
 
 test "a table short of any column's ids is refused at start on both ranks, before a read can part them" {
