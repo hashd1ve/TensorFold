@@ -154,7 +154,7 @@ pub const Engine = struct {
         var asked: ?u32 = null;
         if (e.cfg.family_mtp and s.drafts) {
             // the head reads the prompt's last row and the first token, and drafts the one after it
-            const d: u32 = @intCast(try e.rule.depth(win.who(s)));
+            const d: u32 = @intCast(try e.rule.openDepth(win.who(s)));
             asked = d;
             try e.backend.draft(&.{.{ .stream = s, .follow = &.{}, .first = feed, .rows = null, .start = s.prompt_len, .position = position + 1, .depth = d }});
             s.dropHeld(e.gpa);
