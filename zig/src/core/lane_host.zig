@@ -75,6 +75,7 @@ pub const LaneHost = struct {
         entry: ?*pc.Entry = null, // the kept state the backend restores, until its prompt pass reports
         marks: []const u32 = &.{}, // where the pass keeps states (gpa-owned)
         kept0: u64 = 0, // the store's kept count when the job looked it up
+        whole: bool = false, // refused as a cut-in (error.FillBusy: its kept state gone): it waits for the pass in pieces
 
         /// The backend's prompt pass stands at a mark: the cache keeps the stream's state there.
         fn kept(ptr: *anyopaque, s: *lanes.Stream, at: u32) void {
@@ -93,6 +94,14 @@ pub const LaneHost = struct {
             if (job.stream.reuse_failed) store.resumed(e, job.request.cacheKey(), false) else if (job.stream.cached == e.at) store.resumed(e, job.request.cacheKey(), true);
         }
     };
+
+    /// Where a queued request would resume from memory, for the cut-in test (Store.find changes nothing). Its pass may
+    /// still run from 0 if the state is gone by then.
+    fn resumable(h: *LaneHost, r: *const Request) usize {
+        const store = h.cache orelse return 0;
+        const e = store.find(r.cacheKey(), r.chunks) orelse return 0;
+        return @min(@as(usize, e.at), r.prompt.len);
+    }
 
     pub fn init(gpa: Allocator, io: std.Io, core: *lanes.Engine, info_: Info) LaneHost {
         var enforced = info_;
@@ -303,7 +312,10 @@ pub const LaneHost = struct {
         var at: usize = 0;
         if (h.filling != null) {
             at = for (h.queued.items, 0..) |j, i| {
-                if (h.core.cutsIn(j.request.prompt.len, j.request.images.len > 0)) break i;
+                if (j.whole) continue;
+                const r = j.request;
+                const from = h.resumable(r);
+                if (h.core.cutsIn(r.prompt.len - from, lanes.Engine.picturesPast(r.images, from))) break i;
             } else {
                 h.unlock();
                 return false;
@@ -370,6 +382,12 @@ pub const LaneHost = struct {
             if (e == error.Cancelled) return h.cancel(job);
             // refused for room: while other streams run or a pass fills (this one cut in), it waits in the queue
             if (e == error.ContextFull and (h.core.activeCount() > 0 or h.filling != null)) return h.requeue(job);
+            // refused as a cut-in (its kept state gone as its pass opened): it waits for the pass in pieces, not
+            // tried again between that pass's pieces
+            if (e == error.FillBusy and h.filling != null) {
+                job.whole = true;
+                return h.requeue(job);
+            }
             return h.drop(job, h.words(e));
         };
         if (h.core.filling == &job.stream) {

@@ -157,6 +157,10 @@ pub const Stream = struct {
     chunks: []const u32,
     reuse: Reuse = .{},
     images: []const Image = &.{},
+    /// A cut-in's bound (Engine.cut_in; 0: none): its pass, which runs whole between another's pieces, computes at
+    /// most this many tokens past the state it resumes; a backend that finds the state gone as the pass opens refuses
+    /// it (error.FillBusy) before it runs, and it waits for that pass as a long prompt does.
+    cut_in: u32 = 0,
     cached: u32 = 0, // prompt tokens the backend restored from `reuse` (its prompt pass started there)
     reuse_failed: bool = false, // the backend's restore of `reuse` failed: it prefilled from 0
     context: std.ArrayList(u32) = .empty,
