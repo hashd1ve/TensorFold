@@ -967,6 +967,12 @@ pub fn follow(gpa: std.mem.Allocator, m: *Model) !void {
     defer for (&seqs) |*q| q.deinit(gpa);
     var win_ids: [max_streams]std.ArrayList(i32) = @splat(.empty);
     defer for (&win_ids) |*q| q.deinit(gpa);
+    // on every exit, before `seqs` goes: the Engram readers (the read-ahead, TF_DS_ENGRAM_LEAD's) may still be reading
+    // a prompt's ids, and an exit from a bad frame comes before the join the loop does for the next frame
+    defer {
+        m.joinAhead();
+        m.fill_seq = &.{};
+    }
     var built: Built = .{};
     var step: u64 = 0;
     var slot: usize = 0;
