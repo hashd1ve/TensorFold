@@ -1396,6 +1396,18 @@ pub fn tap(e: *const Engine, ch: *Chunk, j: usize) !void {
     try e.exact.hcMean4(e.s, ch.h, ch.taps + j * ch.cap * c.hidden * 2, c.hidden, ch.n, c.hidden);
 }
 
+/// An extra tap (xtaps.zig): the mean of the streams as they enter the next layer, into out (bf16 [n, D]), the streams
+/// and the pending MoE gather left as they are: a pending post goes into `scratch` (bf16 [n, hc, D]), not the streams.
+pub fn xtap(e: *const Engine, ch: *const Chunk, scratch: u64, out: u64) !void {
+    const c = e.c;
+    var src = ch.h;
+    if (ch.pending) {
+        try tri_basic.hcPost(e.t, ch.gm, ch.h, ch.post, ch.comb, scratch, e.world, ch.n, c.hidden);
+        src = scratch;
+    }
+    try e.exact.hcMean4(e.s, src, out, c.hidden, ch.n, c.hidden);
+}
+
 /// Tap j's rows (bf16 [n, D]).
 pub fn tapRows(e: *const Engine, ch: *const Chunk, j: usize) u64 {
     return ch.taps + j * ch.cap * e.c.hidden * 2;

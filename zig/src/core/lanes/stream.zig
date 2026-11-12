@@ -136,6 +136,7 @@ pub const Spec = struct {
     chunks: []const u32 = &.{}, // where prefill chunks start after 0 (Python's PrefillPlan); empty: the backend's step
     reuse: Reuse = .{},
     images: []const Image = &.{}, // in prompt order; the caller's until the stream is released
+    taps: []const u8 = "", // a file name for the prompt pass's extra taps (a backend that has them; empty: none)
 };
 
 pub const Stream = struct {
@@ -157,6 +158,7 @@ pub const Stream = struct {
     chunks: []const u32,
     reuse: Reuse = .{},
     images: []const Image = &.{},
+    taps: []const u8 = "", // Spec.taps; the caller's until the stream is released
     /// A cut-in's bound (Engine.cut_in; 0: none): its pass, which runs whole between another's pieces, computes at
     /// most this many tokens past the state it resumes; a backend that finds the state gone as the pass opens refuses
     /// it (error.FillBusy) before it runs, and it waits for that pass as a long prompt does.
@@ -214,6 +216,7 @@ pub const Stream = struct {
             .chunks = spec.chunks,
             .reuse = spec.reuse,
             .images = spec.images,
+            .taps = spec.taps,
         };
         try s.context.appendSlice(gpa, spec.prompt);
         return s;

@@ -29,6 +29,7 @@ const link = @import("link.zig");
 const ring2d = @import("ring2d.zig");
 const rdma = @import("rdma.zig");
 const rdma_env = @import("rdma_env.zig");
+const xtaps = @import("xtaps.zig");
 
 /// The served prompt chunk (TF_DS_PREFILL_CHUNK): a prompt runs in chunks that start at its multiples.
 pub const chunk_rows = 2048;
@@ -65,6 +66,8 @@ pub const Options = struct {
     streams: usize = draft.default_streams, // the pool's streams (--parallel; the four-node lane's 16)
     round_ms: ?[]const f64 = null, // the lane core's round costs by rows (TF_DS_ROUND_MS; null: the served ROUND_MS)
     vision_bias: ?[]const u8 = null, // gate_bias_vl.safetensors (null: the kit's vision/): the image-span routing bias
+    xtaps: ?[]const u8 = null, // TF_DS_XTAPS: the layers a marked prompt pass taps (xtaps.zig; rank 0; null: none)
+    xtaps_dir: ?[]const u8 = null, // TF_DS_XTAPS_DIR: where its files go
 };
 
 pub const Model = struct {
@@ -145,6 +148,10 @@ pub const Model = struct {
     // world 4: the 2D split's exchanges (prompt2d.zig, TP4's), with the RDMA rings when asked
     two: ?prompt2d.Two = null,
     rdma_rings: ?ring2d.Rings = null,
+    // xtaps.zig (TF_DS_XTAPS, rank 0): the extra taps' buffers, and the file of the marked pass whose chunk runs next
+    // (lanes sets it before each chunk; null: an unmarked pass, which launches nothing more than it always did)
+    xt: ?xtaps.XTaps = null,
+    xt_sink: ?*xtaps.Sink = null,
 
     /// Loads rank o.rank's weights from the lane's rank cache, links the ranks (rank 0 listens on o.port), opens NCCL
     /// and sets up every buffer. Needs `ctx` current on this thread.
@@ -157,6 +164,8 @@ pub const Model = struct {
         if (std.c.getenv("TF_DS_REPLAY_FLOOR")) |v| prompt.replay_floor = std.mem.eql(u8, std.mem.span(v), "1"); // every rank alike
         m.spans = .empty;
         m.img_buf = null;
+        m.xt = null;
+        m.xt_sink = null;
         m.host = std.heap.ArenaAllocator.init(gpa);
         errdefer m.host.deinit();
         const a = m.host.allocator();
@@ -359,6 +368,10 @@ pub const Model = struct {
 
         m.host_pos = try a.alloc(i64, chunk_rows);
         m.ids64 = try a.alloc(i64, chunk_rows);
+        if (o.xtaps) |spec| if (o.rank == 0) {
+            m.xt = try xtaps.XTaps.init(a, m.ctx.d, spec, o.xtaps_dir orelse return error.NoXTapsDir, c.layers, c.hidden, c.hc, chunk_rows);
+            std.log.info("dsv41: extra taps at {d} layers for marked prompt passes ({d} MiB on the device), their files in {s}", .{ m.xt.?.n, m.xt.?.bytes() >> 20, m.xt.?.dir });
+        };
         m.vocab = sp.world * (if (m.two) |t| t.hw[0] + t.hw[1] else m.w.head.n); // 2D: both pairs' vocabulary parts
         m.logits = try a.alloc(f32, round.max_rows * m.vocab);
         return m;
@@ -368,6 +381,7 @@ pub const Model = struct {
         m.joinAhead();
         m.stream.synchronize() catch {};
         if (m.img_buf) |*b| b.free();
+        if (m.xt) |*x| x.deinit();
         m.spans.deinit(m.gpa);
         if (m.graphs) |*g| g.deinit();
         if (m.pgraphs) |*g| g.deinit();
@@ -596,6 +610,9 @@ pub const Model = struct {
         if (ch.spans.len > 0) try prompt.embedSpans(e, ch);
         if (pt) |t| try t.mark(m.stream, .embed);
         const taps = m.dr != null;
+        // a marked pass's extra taps (xtaps.zig): the rows each listed layer's tap holds of this chunk
+        const xt: ?*xtaps.XTaps = if (m.xt_sink != null) &m.xt.? else null;
+        if (xt) |x| x.at = @splat(.{});
         var floor: usize = 0;
         var kv_done: ?usize = null;
         // Engram rows read ahead on a thread while the GPU runs the layers before them (the served reader pool's
@@ -625,6 +642,9 @@ pub const Model = struct {
             }
         }
         for (0..c.layers) |li| {
+            // an extra tap reads the streams as they enter the layer: before its Engram, and at the decoder's first
+            // layer before the replay cut (every row of the chunk)
+            if (xt) |x| try m.xtTap(x, li);
             if (li == c.layers / 2) {
                 if (!try prompt.replayCut(e, ch, &m.view, &shared, li, replay, m.host_pos)) {
                     // encoder-only: no synchronize either (as at the chunk's end below), so the next chunk's host steps
@@ -633,6 +653,7 @@ pub const Model = struct {
                         try m.stream.synchronize();
                         try t.finish();
                     }
+                    if (xt) |x| try m.xtFlush(x);
                     return false;
                 }
                 floor = replay;
@@ -684,14 +705,20 @@ pub const Model = struct {
             if (pt) |t| try t.mark(m.stream, .gather_m);
             prompt.endLayer(ch);
         }
+        if (xt) |x| try m.xtTap(x, c.layers); // the streams after the last layer
         try prompt.head(e, ch);
         if (pt) |t| try t.mark(m.stream, .head);
         if (m.dr) |*dr| {
-            // its taps (the tap layers side by side) into the slot's drafter rings
+            // its taps (the tap layers side by side) into the slot's drafter rings: the chunk's last window rows, which
+            // the served replay's chunk is (at most `window` rows reach here); a full pass's chunk (a marked request's,
+            // replay 0) has more, and the rings and the absorb's buffers hold a window
             const dw = c.hidden;
-            for (0..c.dspark_taps.slice().len) |j| try e.ops.copyRows(e.s, prompt.tapRows(e, ch, j), dw * 2, dr.at + j * dw * 2, dr.taps_w * 2, dw * 2, ch.n);
-            try dr.absorb(e, ch, &m.dpool.?, m.fill_slot, dr.at, ch.n, ch.start);
+            const keep = @min(ch.n, c.window);
+            const skip = ch.n - keep;
+            for (0..c.dspark_taps.slice().len) |j| try e.ops.copyRows(e.s, prompt.tapRows(e, ch, j) + skip * dw * 2, dw * 2, dr.at + j * dw * 2, dr.taps_w * 2, dw * 2, keep);
+            try dr.absorb(e, ch, &m.dpool.?, m.fill_slot, dr.at, keep, ch.start + skip);
         }
+        if (xt) |x| try m.xtFlush(x);
         // no synchronize: the next chunk's host steps (its first Engram layer's hashing, table reads and decode, ~0.14 s
         // at 2,048 rows) run while this chunk's kernels do; readers of the results (the prompt's logits) synchronize.
         // The profile (--profile 2) times a chunk to its end, so it alone waits.
@@ -700,6 +727,26 @@ pub const Model = struct {
             try t.finish();
         }
         return true;
+    }
+
+    /// A marked pass's tap of the streams entering `layer`, when it is listed: this chunk's rows there.
+    fn xtTap(m: *Model, x: *xtaps.XTaps, layer: usize) !void {
+        const j = x.index(layer) orelse return;
+        try prompt.xtap(&m.eng, &m.ch, x.scratch.ptr, x.rows(j));
+        x.at[j] = .{ .start = m.ch.start, .n = m.ch.n };
+    }
+
+    /// The chunk's taps to the marked pass's file, once its kernels are done.
+    fn xtFlush(m: *Model, x: *xtaps.XTaps) !void {
+        const sink = m.xt_sink orelse return;
+        const d = m.ctx.d;
+        try m.stream.synchronize();
+        for (x.at[0..x.n], 0..) |mk, j| {
+            if (mk.n == 0) continue;
+            const b = x.host[0 .. mk.n * x.d * 2];
+            try d.check(d.api.cuMemcpyDtoH_v2(b.ptr, x.rows(j), b.len), "cuMemcpyDtoH");
+            sink.rows(x.layers[j], mk.start, mk.n, b);
+        }
     }
 
     /// The prompt's logits (its last row's, the ranks' columns in rank order) after a fill's last chunk.

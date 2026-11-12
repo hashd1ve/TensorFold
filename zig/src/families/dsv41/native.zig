@@ -24,6 +24,9 @@
 //!   TF_DS_FIX_K=K                               a measurement: every drafted stream verifies K drafts a round
 //!   TF_DS_SOLO_OVERHEAD=1                       a lone drafted stream's head windows cost the fixed draft allowance
 //!   TF_DS_NO_COPIES=1                           a drafted stream proposes no suffix-lookup copy windows
+//!   TF_DS_XTAPS=L,L,... TF_DS_XTAPS_DIR=DIR     xtaps.zig: a request with "taps": "name" has its prompt pass write the
+//!                                               streams' mean entering each listed layer to DIR/name.xtaps (unset:
+//!                                               no buffer and no launch; the field is then ignored)
 //! The kernel set (TENSORFOLD_CUDA_KERNELS) is the recorded Triton set (aot_pack.py). The pool holds --context
 //! positions for every stream together (each takes an extent: its prompt, its max_tokens and a round's rows).
 //! TF_TP_WORLD=4: the four nodes of the exact 2D split (prompt2d.zig), ranks 1-3 `tf-dsv41-lanes` following on the
@@ -146,6 +149,8 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
         .arena_bytes = arena_gib << 30,
         .round_rows = if (getenv("TF_DS_ROUND_ROWS")) |v| std.fmt.parseInt(usize, v, 10) catch return error.BadRoundRows else round.default_rows,
         .round_ms = if (getenv("TF_DS_ROUND_MS")) |v| lanes_mod.parseMs(std.heap.page_allocator, v) catch return error.BadRoundMs else null,
+        .xtaps = nonEmpty(getenv("TF_DS_XTAPS")),
+        .xtaps_dir = nonEmpty(getenv("TF_DS_XTAPS_DIR")),
         .streams = if (getenv("TF_DS_STREAMS")) |v| std.fmt.parseInt(usize, v, 10) catch return error.BadStreams else model.max_streams_default,
     });
     errdefer st.m.close();

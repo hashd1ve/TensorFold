@@ -16,6 +16,7 @@
 const std = @import("std");
 const lanes = @import("lanes");
 const model = @import("model.zig");
+const xtaps = @import("xtaps.zig");
 const round = @import("round.zig");
 const draft = @import("draft.zig");
 const sampling = @import("sampling.zig");
@@ -296,7 +297,21 @@ fn noteStale(sn: *const Snap, why: []const u8) void {
 }
 
 /// A prompt pass between its pieces: the chunk it runs next and what its chunk loop reads.
-const Fill = struct { s: *const lanes.Stream, slot: usize, len: usize, replay: usize, last_end: usize, start: usize, head: bool = false };
+const Fill = struct {
+    s: *const lanes.Stream,
+    slot: usize,
+    len: usize,
+    replay: usize,
+    last_end: usize,
+    start: usize,
+    head: bool = false,
+    xt: ?*xtaps.Sink = null, // a marked pass's taps file (xtaps.zig), the pass's until it ends or is dropped
+
+    /// The pass goes without its first token (an error, a cancel, its stream released): its taps file with it.
+    fn drop(f: *const Fill, gpa: std.mem.Allocator) void {
+        if (f.xt) |k| k.close(gpa, false);
+    }
+};
 
 /// How long a request waits for the live stream that holds the kept state it resumes from to end (then it resumes
 /// in place and every kept state stays) before other kept states give their room for a copy of it.
@@ -455,7 +470,10 @@ pub const Lanes = struct {
         if (self.fill == null) {
             if (self.paused != null and self.paused.?.s == s) try self.fillResume() else try self.fillOpen(s);
         }
-        errdefer self.fill = null;
+        errdefer if (self.fill) |ff| {
+            ff.drop(self.gpa);
+            self.fill = null;
+        };
         const f = &self.fill.?;
         const seq = self.seqs[f.slot].items;
         m.fill_seq = seq;
@@ -476,6 +494,8 @@ pub const Lanes = struct {
                 try self.wire.int(self.gpa, u64, f.replay);
                 try self.flush();
             }
+            m.xt_sink = f.xt; // (a marked pass: this chunk's taps go to its file; rank 1 taps nothing)
+            defer m.xt_sink = null;
             f.head = m.fillChunk(seq[0 .. start + n], start, n, f.replay) catch |err| return endOnRankFault(err);
             f.start += n;
             if (s.reuse.hook) |k| if (f.start < len and f.start <= f.replay and (f.start == f.last_end or markEnds(s.reuse.marks, f.start))) k.at(k.ptr, s, @intCast(f.start));
@@ -483,6 +503,7 @@ pub const Lanes = struct {
         if (f.start < f.len) return false;
         const done = f.*;
         self.fill = null;
+        errdefer done.drop(self.gpa);
         if (self.prof) |*p| p.prefills += 1;
         if (!done.head) return error.NoPromptLogits;
         const logits = try m.promptLogitsHost();
@@ -493,6 +514,7 @@ pub const Lanes = struct {
         }
         const token = try draw(logits, done.len, s.sampling);
         self.streams.getPtr(s).?.first = self.take(token);
+        if (done.xt) |k| k.close(self.gpa, true);
         return true;
     }
 
@@ -519,6 +541,10 @@ pub const Lanes = struct {
         if (len == 0) return error.EmptyPrompt;
         const size = std.mem.alignForward(usize, len + s.max_new + m.eng.round_rows + 2, model.chunk_rows);
         if (size > m.pool_cap) return error.PromptTooLong;
+        // a marked request (its "taps" names a file) on a rank that taps (TF_DS_XTAPS): the pass writes its extra taps
+        // there, and runs every layer on every row unless the name asks for the served replay
+        const sink: ?*xtaps.Sink = if (m.xt != null and s.taps.len > 0) try xtaps.Sink.open(gpa, &m.xt.?, s.taps, ids) else null;
+        errdefer if (sink) |k| k.close(gpa, false);
         if (self.streams.fetchRemove(s)) |old| self.used[old.value.slot] = false;
         const slot = std.mem.indexOfScalar(bool, self.used[0..self.m.streams], false) orelse return error.NoFreeSlot;
         var taken: [max_streams][2]usize = undefined;
@@ -636,7 +662,7 @@ pub const Lanes = struct {
             }
             try m.setImages(spans.items, rows.items);
         }
-        const replay = len -| m.cfg.window;
+        const replay = if (sink != null and xtaps.fullPass(s.taps)) 0 else len -| m.cfg.window;
         var start: usize = 0;
         if (kept) |sn| {
             if (try self.begin(.snap_restore)) {
@@ -655,7 +681,7 @@ pub const Lanes = struct {
         // where this pass keeps states: the cache's marks and its last chunk end before the replay (the served lane's
         // kept prompt), each at the chunk end at or before it
         const last_end = @min(replay, len - 1) / model.chunk_rows * model.chunk_rows;
-        self.fill = .{ .s = s, .slot = slot, .len = len, .replay = replay, .last_end = last_end, .start = start };
+        self.fill = .{ .s = s, .slot = slot, .len = len, .replay = replay, .last_end = last_end, .start = start, .xt = sink };
     }
 
     fn firstFn(ptr: *anyopaque, s: *lanes.Stream, position: u64) anyerror!u64 {
@@ -943,9 +969,11 @@ pub const Lanes = struct {
         if (self.fill) |f| if (f.s == s) {
             self.m.joinAhead();
             self.m.fill_seq = &.{};
+            f.drop(self.gpa);
             self.fill = null;
         };
         if (self.paused) |f| if (f.s == s) {
+            f.drop(self.gpa);
             self.paused = null;
         };
         const kv = self.streams.fetchRemove(s) orelse return;

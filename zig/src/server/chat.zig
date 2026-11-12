@@ -193,6 +193,11 @@ pub fn prepare(srv: *Server, cx: *Cx, input: Input, gone: anytype) Failure!Prepa
         .tools_json = if (input.tools.len > 0) try json.stringify(a, .{ .array = @constCast(input.tools) }, .{ .ascii = false }) else "",
     };
     try srv.checkFeatures(cx, f, input.tools.len > 0, thinking, rendered.ids, input.tools, &request);
+    // "taps": a file name for the prompt pass's extra taps (an engine started with them; elsewhere it does nothing)
+    if (f.get("taps")) |t| if (t != .null) {
+        if (t != .string or !tapsName(t.string)) return cx.refuse("taps must be a file name: 1 to 64 of letters, digits, '_', '-' and '.', not starting with '.'");
+        request.taps = t.string;
+    };
     if (thinking) {
         const budget_field = f.get("thinking_budget");
         const budget: i64 = if (budget_field != null and budget_field.?.truthy()) budget_field.?.int64() orelse 0 else srv.config.thinking_budget;
@@ -204,6 +209,13 @@ pub fn prepare(srv: *Server, cx: *Cx, input: Input, gone: anytype) Failure!Prepa
         }
     }
     return .{ .input = input, .request = request, .prompt_len = rendered.ids.len, .received = received, .thinking = thinking, .effort = effort, .sampled = sampling != null, .drafts = drafts, .stops = stops_opt, .preparing = preparing };
+}
+
+/// A "taps" file name (the dsv41 family's xtaps.validName, which checks it again where the file is made).
+fn tapsName(name: []const u8) bool {
+    if (name.len == 0 or name.len > 64 or name[0] == '.') return false;
+    for (name) |ch| if (!(std.ascii.isAlphanumeric(ch) or ch == '_' or ch == '.' or ch == '-')) return false;
+    return true;
 }
 
 /// Submit a prepared request and collect its reply; ``sink`` hears the stream (null: not streamed).

@@ -78,6 +78,9 @@ pub const Request = struct {
     structure: ?Structure = null,
     /// Stop a short exact cycle while the think block is open.
     loop_guard: bool = false,
+    /// A file name for the prompt pass's extra taps (an engine that has them: dsv41's xtaps.zig); empty: none. Such a
+    /// request neither resumes a kept prompt state nor keeps one: its pass runs from the prompt's first token.
+    taps: []const u8 = "",
 
     /// What the prompt cache matches and keeps under: `cache_key`, or the prompt when it has none.
     pub fn cacheKey(r: *const Request) []const u32 {
