@@ -137,6 +137,9 @@ pub const Spec = struct {
     reuse: Reuse = .{},
     images: []const Image = &.{}, // in prompt order; the caller's until the stream is released
     taps: []const u8 = "", // a file name for the prompt pass's extra taps (a backend that has them; empty: none)
+    edits: []const u8 = "", // a file name for its edits (the same)
+    lens: u8 = 0, // its lens rows in the taps file: 0 none, 1 their largest logits, 2 whole
+    streams: u32 = 0, // the last positions whose streams go to the taps file
 };
 
 pub const Stream = struct {
@@ -159,6 +162,9 @@ pub const Stream = struct {
     reuse: Reuse = .{},
     images: []const Image = &.{},
     taps: []const u8 = "", // Spec.taps; the caller's until the stream is released
+    edits: []const u8 = "", // Spec.edits, as taps
+    lens: u8 = 0,
+    streams: u32 = 0,
     /// A cut-in's bound (Engine.cut_in; 0: none): its pass, which runs whole between another's pieces, computes at
     /// most this many tokens past the state it resumes; a backend that finds the state gone as the pass opens refuses
     /// it (error.FillBusy) before it runs, and it waits for that pass as a long prompt does.
@@ -217,6 +223,9 @@ pub const Stream = struct {
             .reuse = spec.reuse,
             .images = spec.images,
             .taps = spec.taps,
+            .edits = spec.edits,
+            .lens = spec.lens,
+            .streams = spec.streams,
         };
         try s.context.appendSlice(gpa, spec.prompt);
         return s;

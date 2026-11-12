@@ -27,6 +27,12 @@
 //!   TF_DS_XTAPS=L,L,... TF_DS_XTAPS_DIR=DIR     xtaps.zig: a request with "taps": "name" has its prompt pass write the
 //!                                               streams' mean entering each listed layer to DIR/name.xtaps (unset:
 //!                                               no buffer and no launch; the field is then ignored)
+//!   TF_DS_XTAPS_ROWS=R                          a marked pass's chunk rows at most (smaller tap buffers; a longer
+//!                                               marked prompt is refused)
+//!   TF_DS_XEDIT=MiB                             xedit.zig, on every rank: a request's "edits": "name" changes its
+//!                                               prompt pass's streams as DIR/name.xedit says, and "lens": 1|2 (with
+//!                                               "taps") writes the head's logits of each tapped layer; "streams": K
+//!                                               the streams themselves of the last K positions
 //! The kernel set (TENSORFOLD_CUDA_KERNELS) is the recorded Triton set (aot_pack.py). The pool holds --context
 //! positions for every stream together (each takes an extent: its prompt, its max_tokens and a round's rows).
 //! TF_TP_WORLD=4: the four nodes of the exact 2D split (prompt2d.zig), ranks 1-3 `tf-dsv41-lanes` following on the
@@ -151,6 +157,7 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
         .round_ms = if (getenv("TF_DS_ROUND_MS")) |v| lanes_mod.parseMs(std.heap.page_allocator, v) catch return error.BadRoundMs else null,
         .xtaps = nonEmpty(getenv("TF_DS_XTAPS")),
         .xtaps_dir = nonEmpty(getenv("TF_DS_XTAPS_DIR")),
+        .xtaps_rows = if (nonEmpty(getenv("TF_DS_XTAPS_ROWS"))) |v| std.fmt.parseInt(usize, v, 10) catch return error.BadXTaps else 0,
         .streams = if (getenv("TF_DS_STREAMS")) |v| std.fmt.parseInt(usize, v, 10) catch return error.BadStreams else model.max_streams_default,
     });
     errdefer st.m.close();
@@ -192,6 +199,12 @@ pub fn explain(_: ?*anyopaque, err: anyerror) ?[]const u8 {
         error.EngramRankFault => "a prompt chunk's Engram rows could not be read on one rank (its disk or memory failed; the other rank waits for it in the layer's collective, so the pair ends and its supervisor restarts both ranks)",
         error.ContextFull => "the streams' prompts and budgets fill the context's pool: lower max_tokens, or retry when a stream ends",
         error.PromptTooLong => "the prompt and its max_tokens do not fit the context window",
+        error.XEditOff => "this server was started without edits (TF_DS_XEDIT on every rank; ./start.sh --edits): \"edits\" and \"lens\" need them",
+        error.LensNeedsTaps => "\"lens\" and \"streams\" write to the request's taps file: name one with \"taps\" on a server started with taps",
+        error.XTapsRows => "the prompt is longer than a marked pass's chunk rows (TF_DS_XTAPS_ROWS)",
+        error.XEditTooLarge => "the edits file holds more rows than this server's edits buffer (TF_DS_XEDIT, in MiB)",
+        error.NoXEditFile => "the edits file could not be read from the taps directory (TF_DS_XTAPS_DIR/name.xedit), or it is larger than the edits buffer (TF_DS_XEDIT, in MiB)",
+        error.NotAnXEditFile, error.BadXEditVersion, error.BadXEditHidden, error.BadXEdit, error.ShortXEditFile, error.BadXEditPosition, error.BadXEditRows, error.BadXEditValue => "the edits file is not one this model can run (xedit.zig has the format: its hidden size, positions inside the prompt, finite values)",
         error.NoVisionKit => "this checkpoint reads images: its kit (TF_DS_KIT) needs vision/torch_fmha_sm120.cubin and vision/gate_bias_vl.safetensors",
         else => null,
     };

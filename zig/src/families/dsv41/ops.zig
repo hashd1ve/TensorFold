@@ -37,6 +37,7 @@ pub const Ops = struct {
     copy16: cuda.Function,
     argmax_rows: cuda.Function,
     gpu_clock: cuda.Function,
+    k_xedit: cuda.Function,
 
     /// The three images (cuda.kernels.torch_pointwise, torch_movement and dsv41_ops, or the fatbins' bytes).
     pub fn load(d: *const cuda.Driver, pointwise: []const u8, movement: []const u8, family: []const u8) !Ops {
@@ -68,6 +69,7 @@ pub const Ops = struct {
             .copy16 = try fm.function("tf_ds_copy_rows16_kernel"),
             .argmax_rows = try fm.function("tf_ds_argmax_rows_kernel"),
             .gpu_clock = try fm.function("tf_ds_clock_kernel"),
+            .k_xedit = try fm.function("tf_ds_xedit_kernel"),
         };
     }
 
@@ -290,6 +292,23 @@ pub const Ops = struct {
         a.add(@as(c_int, @intCast(n)));
         a.add(out);
         try go(o.argmax_rows, s, rows, 1024, &a);
+    }
+
+    /// xedit.zig's edit of `rows` rows of the streams h (bf16 [rows, hc, d]) on the streams of `mask`: data fp32 rows of
+    /// d, `ld` floats apart (0: one row for them all); op and scale as xedit.Op (tf_ds_xedit_kernel).
+    pub fn xedit(o: *const Ops, s: cuda.Stream, h: u64, data: u64, ld: usize, rows: usize, d: usize, hc: usize, op: u32, mask: u32, scale: f32) !void {
+        if (rows == 0) return;
+        if (hc == 0 or hc > 8 or rows > 65535 or op == 0 or op > 4) return error.UnsupportedShape;
+        var a: cuda.Args = .{};
+        a.add(h);
+        a.add(data);
+        a.add(@as(u64, ld));
+        a.add(@as(c_int, @intCast(d)));
+        a.add(@as(c_int, @intCast(hc)));
+        a.add(@as(c_int, @intCast(op)));
+        a.add(mask);
+        a.add(scale);
+        try go(o.k_xedit, s, rows, 256, &a);
     }
 
     /// The GPU clock (ns) into buf[i] when the stream reaches it (a profile).

@@ -511,3 +511,59 @@ extern "C" __global__ void tf_ds_vspan_kernel(const unsigned char* types, const 
         out[i] = ty == 1 ? rows[(long long)row_of[t] * dim + c] : ty == 0 ? start[c] : ty == 2 ? newline[c] : end[c];
     }
 }
+
+// xedit.zig: an edit of a marked prompt pass's streams. h [rows, hc, D] bf16; data fp32 rows of D, ld floats apart (0:
+// one row for every row of h); mask: the streams it writes (bit s). op 1 add: x_s += scale * v. op 2 patch:
+// x_s += scale * (v - the mean of the row's hc streams). op 3 ablate: x_s -= scale * (x_s.v / v.v) v, each stream its own
+// dot. op 4 set: x_s += scale * (v - x_s). fp32 arithmetic, each value rounded to bf16 once. A row a block of 256
+// threads, thread t the columns t, t + 256, ...: no column is another thread's, and ablate's dots are every thread's
+// partials (all read before any write) summed in thread order, by every thread alike. hc at most 8.
+extern "C" __global__ void __launch_bounds__(256) tf_ds_xedit_kernel(__nv_bfloat16* h, const float* data,
+                                                                     unsigned long long ld, int D, int hc, int op,
+                                                                     unsigned int mask, float scale) {
+    __shared__ float part[9][256];
+    __nv_bfloat16* x = h + (unsigned long long)blockIdx.x * hc * D;
+    const float* v = data + (unsigned long long)blockIdx.x * ld;
+    const int t = threadIdx.x, T = blockDim.x;
+    if (op == 3) {
+        float acc[9];
+        for (int s = 0; s <= hc; s++) acc[s] = 0.f;
+        for (int d = t; d < D; d += T) {
+            const float vd = v[d];
+            for (int s = 0; s < hc; s++) acc[s] += __bfloat162float(x[s * D + d]) * vd;
+            acc[hc] += vd * vd;
+        }
+        for (int s = 0; s <= hc; s++) part[s][t] = acc[s];
+        __syncthreads();
+        float dot[9];
+        for (int s = 0; s <= hc; s++) {
+            float a = 0.f;
+            for (int i = 0; i < T; i++) a += part[s][i];
+            dot[s] = a;
+        }
+        if (!(dot[hc] > 0.f)) return;
+        for (int s = 0; s < hc; s++) {
+            if (!((mask >> s) & 1u)) continue;
+            const float k = scale * (dot[s] / dot[hc]);
+            for (int d = t; d < D; d += T) x[s * D + d] = __float2bfloat16_rn(__bfloat162float(x[s * D + d]) - k * v[d]);
+        }
+        return;
+    }
+    for (int d = t; d < D; d += T) {
+        const float vd = v[d];
+        float mean = 0.f;
+        if (op == 2) {
+            for (int s = 0; s < hc; s++) mean += __bfloat162float(x[s * D + d]);
+            mean /= (float)hc;
+        }
+        for (int s = 0; s < hc; s++) {
+            if (!((mask >> s) & 1u)) continue;
+            const float xs = __bfloat162float(x[s * D + d]);
+            float y = xs;
+            if (op == 1) y = xs + scale * vd;
+            else if (op == 2) y = xs + scale * (vd - mean);
+            else if (op == 4) y = xs + scale * (vd - xs);
+            x[s * D + d] = __float2bfloat16_rn(y);
+        }
+    }
+}

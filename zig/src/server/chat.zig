@@ -198,6 +198,22 @@ pub fn prepare(srv: *Server, cx: *Cx, input: Input, gone: anytype) Failure!Prepa
         if (t != .string or !tapsName(t.string)) return cx.refuse("taps must be a file name: 1 to 64 of letters, digits, '_', '-' and '.', not starting with '.'");
         request.taps = t.string;
     };
+    // "edits": a file name for the prompt pass's edits; "lens": 1 (each row's largest logits) or 2 (whole rows) and
+    // "streams": K (the last K positions' streams) into the taps file (an engine started with them)
+    if (f.get("edits")) |t| if (t != .null) {
+        if (t != .string or !tapsName(t.string)) return cx.refuse("edits must be a file name: 1 to 64 of letters, digits, '_', '-' and '.', not starting with '.'");
+        request.edits = t.string;
+    };
+    if (f.get("lens")) |t| if (t != .null) {
+        const v: i64 = if (t == .bool) @intFromBool(t.bool) else t.int64() orelse -1;
+        if (v < 0 or v > 2) return cx.refuse("lens must be 0, 1 (each row's largest logits) or 2 (whole rows)");
+        request.lens = @intCast(v);
+    };
+    if (f.get("streams")) |t| if (t != .null) {
+        const v: i64 = t.int64() orelse -1;
+        if (v < 0 or v > 64) return cx.refuse("streams must be a count of the prompt's last positions, 0 to 64");
+        request.streams = @intCast(v);
+    };
     if (thinking) {
         const budget_field = f.get("thinking_budget");
         const budget: i64 = if (budget_field != null and budget_field.?.truthy()) budget_field.?.int64() orelse 0 else srv.config.thinking_budget;

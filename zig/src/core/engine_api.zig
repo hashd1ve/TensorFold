@@ -81,6 +81,17 @@ pub const Request = struct {
     /// A file name for the prompt pass's extra taps (an engine that has them: dsv41's xtaps.zig); empty: none. Such a
     /// request neither resumes a kept prompt state nor keeps one: its pass runs from the prompt's first token.
     taps: []const u8 = "",
+    /// A file name for the prompt pass's edits, its lens rows in the taps file (0 none, 1 their largest logits, 2
+    /// whole) and the last positions whose streams go there (dsv41's xedit.zig and xtaps.zig); such a request is
+    /// marked as one with taps is.
+    edits: []const u8 = "",
+    lens: u8 = 0,
+    streams: u32 = 0,
+
+    /// A request whose prompt pass is tapped or edited: it runs from the prompt's first token, apart from the cache.
+    pub fn marked(r: *const Request) bool {
+        return r.taps.len > 0 or r.edits.len > 0 or r.lens > 0 or r.streams > 0;
+    }
 
     /// What the prompt cache matches and keeps under: `cache_key`, or the prompt when it has none.
     pub fn cacheKey(r: *const Request) []const u32 {

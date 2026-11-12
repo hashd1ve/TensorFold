@@ -17,6 +17,7 @@ const std = @import("std");
 const lanes = @import("lanes");
 const model = @import("model.zig");
 const xtaps = @import("xtaps.zig");
+const xedit = @import("xedit.zig");
 const round = @import("round.zig");
 const draft = @import("draft.zig");
 const sampling = @import("sampling.zig");
@@ -38,7 +39,7 @@ pub const image_piece = 32 << 10;
 pub var logits_sha = false;
 
 /// The primitives rank 0 sends rank 1 (each frame: kind u8, step u64, its fields little-endian).
-pub const Kind = enum(u8) { fill_begin = 1, fill_chunk = 2, verify = 3, pass = 4, snap_save = 5, snap_restore = 6, snap_drop = 7, fill_images = 8, done = 9, fill_resume = 10 };
+pub const Kind = enum(u8) { fill_begin = 1, fill_chunk = 2, verify = 3, pass = 4, snap_save = 5, snap_restore = 6, snap_drop = 7, fill_images = 8, done = 9, fill_resume = 10, fill_mark = 11, fill_xdata = 12 };
 
 /// A frame being written.
 pub const Wire = struct {
@@ -313,6 +314,12 @@ const Fill = struct {
     }
 };
 
+/// A stream whose prompt pass carries a plan (xedit.zig: edits or a lens): every rank holds one plan at a time, so no
+/// pass cuts into such a pass and it cuts into none.
+fn planned(s: *const lanes.Stream) bool {
+    return s.edits.len > 0 or s.lens > 0;
+}
+
 /// How long a request waits for the live stream that holds the kept state it resumes from to end (then it resumes
 /// in place and every kept state stays) before other kept states give their room for a copy of it.
 const held_wait_ns: u64 = 10 * std.time.ns_per_s;
@@ -463,7 +470,7 @@ pub const Lanes = struct {
         if (self.fill) |f| if (f.s != s) {
             // a prompt cuts in between this pass's pieces: it waits (one at most; neither pass needs picture rows: a cut-in's
             // pictures wholly before the state it resumes run no tower and set no spans), its next piece resumes it
-            if (self.paused != null or f.s.images.len > 0 or lanes.Engine.picturesPast(s.images, s.reuse.at)) return error.FillBusy;
+            if (self.paused != null or f.s.images.len > 0 or lanes.Engine.picturesPast(s.images, s.reuse.at) or planned(f.s) or planned(s)) return error.FillBusy;
             self.paused = f;
             self.fill = null;
         };
@@ -495,7 +502,15 @@ pub const Lanes = struct {
                 try self.flush();
             }
             m.xt_sink = f.xt; // (a marked pass: this chunk's taps go to its file; rank 1 taps nothing)
-            defer m.xt_sink = null;
+            m.xt_lens = if (f.xt != null) s.lens else 0;
+            m.xt_streams = if (f.xt != null) s.streams else 0;
+            defer {
+                m.xt_sink = null;
+                m.xt_lens = 0;
+                m.xt_streams = 0;
+            }
+            m.fill_len = len;
+            m.fill_last = start + n == len;
             f.head = m.fillChunk(seq[0 .. start + n], start, n, f.replay) catch |err| return endOnRankFault(err);
             f.start += n;
             if (s.reuse.hook) |k| if (f.start < len and f.start <= f.replay and (f.start == f.last_end or markEnds(s.reuse.marks, f.start))) k.at(k.ptr, s, @intCast(f.start));
@@ -512,6 +527,7 @@ pub const Lanes = struct {
             std.crypto.hash.sha2.Sha256.hash(std.mem.sliceAsBytes(logits), &dg, .{});
             std.debug.print("{{\"prompt_logits\": \"{s}\", \"sha256\": \"{s}\"}}\n", .{ s.id, std.fmt.bytesToHex(dg, .lower) });
         }
+        if (done.xt) |k| k.logits(logits);
         const token = try draw(logits, done.len, s.sampling);
         self.streams.getPtr(s).?.first = self.take(token);
         if (done.xt) |k| k.close(self.gpa, true);
@@ -545,6 +561,31 @@ pub const Lanes = struct {
         // there, and runs every layer on every row unless the name asks for the served replay
         const sink: ?*xtaps.Sink = if (m.xt != null and s.taps.len > 0) try xtaps.Sink.open(gpa, &m.xt.?, s.taps, ids) else null;
         errdefer if (sink) |k| k.close(gpa, false);
+        // xedit.zig: the request's edits file read and checked against this prompt, and its lens over the tapped
+        // layers, before anything of the pass is placed or sent; a marked prompt's chunks fit the taps' buffers
+        if ((s.lens > 0 or s.streams > 0) and sink == null) return error.LensNeedsTaps;
+        if (sink != null and (@min(len, model.chunk_rows) > m.xt.?.cap or s.streams > xtaps.max_stream_rows)) return error.XTapsRows;
+        const want_plan = planned(s);
+        var plan: xedit.Plan = .{};
+        var xfile: []u8 = &.{};
+        defer if (xfile.len > 0) gpa.free(xfile);
+        var xat: [xedit.max_edits]usize = undefined;
+        if (want_plan) {
+            const x = if (m.xe) |*x| x else return error.XEditOff;
+            if (s.edits.len > 0) {
+                if (!xtaps.validName(s.edits)) return error.NoXEditFile;
+                var pb: [600]u8 = undefined;
+                const path = std.fmt.bufPrint(&pb, "{s}/{s}.xedit", .{ m.xdir orelse return error.NoXEditFile, s.edits }) catch return error.NoXEditFile;
+                xfile = std.Io.Dir.cwd().readFileAlloc(m.io, path, gpa, .limited(xedit.fileLimit(m.cfg.hidden, x.cap_rows))) catch |err| return if (err == error.OutOfMemory) error.OutOfMemory else error.NoXEditFile;
+                try xedit.parse(xfile, m.cfg.hidden, len, &plan, &xat);
+            }
+            if (s.lens > 0) {
+                const xt = &m.xt.?;
+                plan.n_lens = xt.n;
+                @memcpy(plan.lens[0..xt.n], xt.layers[0..xt.n]);
+            }
+            try plan.check(m.cfg.layers, m.cfg.hc, len, x.cap_rows);
+        }
         if (self.streams.fetchRemove(s)) |old| self.used[old.value.slot] = false;
         const slot = std.mem.indexOfScalar(bool, self.used[0..self.m.streams], false) orelse return error.NoFreeSlot;
         var taken: [max_streams][2]usize = undefined;
@@ -662,7 +703,32 @@ pub const Lanes = struct {
             }
             try m.setImages(spans.items, rows.items);
         }
-        const replay = if (sink != null and xtaps.fullPass(s.taps)) 0 else len -| m.cfg.window;
+        // the plan and its rows to every rank, after the fill's start (which clears the last one) and before its chunks
+        if (want_plan) {
+            if (try self.begin(.fill_mark)) {
+                try plan.put(gpa, &self.wire);
+                try self.flush();
+            }
+            try m.xeSet(plan, len);
+            var off: usize = 0;
+            for (plan.edits[0..plan.n], 0..) |ed, i| {
+                const bytes = xfile[xat[i]..][0 .. @as(usize, ed.rows) * m.cfg.hidden * 4];
+                var at: usize = 0;
+                while (at < bytes.len) {
+                    const n = @min(xedit.piece, bytes.len - at);
+                    if (try self.begin(.fill_xdata)) {
+                        try self.wire.int(gpa, u64, off + at);
+                        try self.wire.buf.appendSlice(gpa, bytes[at..][0..n]);
+                        try self.flush();
+                    }
+                    at += n;
+                }
+                try m.xeData(off, bytes);
+                off += bytes.len;
+            }
+        }
+        // a tapped or planned pass runs every layer on every row, unless its taps' name asks for the served replay
+        const replay = if (sink != null) (if (xtaps.fullPass(s.taps)) 0 else len -| m.cfg.window) else if (want_plan) 0 else len -| m.cfg.window;
         var start: usize = 0;
         if (kept) |sn| {
             if (try self.begin(.snap_restore)) {
@@ -1007,6 +1073,12 @@ fn endOnRankFault(err: anyerror) anyerror {
     return err;
 }
 
+/// A follower that cannot take a marked pass's plan: rank 0 runs it, so both ranks restart (as endOnRankFault).
+fn xeFault(err: anyerror) noreturn {
+    std.log.err("dsv41: this rank cannot run a marked pass's plan ({s}): TF_DS_XEDIT must be set alike on every rank; exiting 75 so that both ranks restart", .{@errorName(err)});
+    std.process.exit(75);
+}
+
 /// A follower's verify times with Model.prof (a profile on ranks 1-3: rounds, issue and wall ns summed).
 pub var follow_prof: struct { rounds: u64 = 0, enqueue: u64 = 0, forward: u64 = 0 } = .{};
 
@@ -1051,12 +1123,14 @@ pub fn follow(gpa: std.mem.Allocator, m: *Model) !void {
             8 => .fill_images,
             9 => .done,
             10 => .fill_resume,
+            11 => .fill_mark,
+            12 => .fill_xdata,
             else => return error.BadFrame,
         };
         if (try r.int(u64) != step) return error.OutOfStep;
         step += 1;
         // a chunk's read-ahead of the next is done before anything but that chunk (a prompt's ids may change)
-        if (kind != .fill_chunk and kind != .snap_save and kind != .snap_restore and kind != .fill_images) {
+        if (kind != .fill_chunk and kind != .snap_save and kind != .snap_restore and kind != .fill_images and kind != .fill_mark and kind != .fill_xdata) {
             m.joinAhead();
             m.fill_seq = &.{};
         }
@@ -1083,6 +1157,8 @@ pub fn follow(gpa: std.mem.Allocator, m: *Model) !void {
                 const replay: usize = @intCast(try r.int(u64));
                 if (start + n > seqs[slot].items.len) return error.BadChunk;
                 if (m.fill_seq.len == 0) m.fill_seq = seqs[slot].items; // a piece after a round: the read-ahead again
+                m.fill_len = seqs[slot].items.len;
+                m.fill_last = start + n == seqs[slot].items.len;
                 _ = m.fillChunk(seqs[slot].items[0 .. start + n], start, n, replay) catch |err| refused(endOnRankFault(err));
             },
             .verify => {
@@ -1119,6 +1195,17 @@ pub fn follow(gpa: std.mem.Allocator, m: *Model) !void {
                     slots[i] = try r.int(i64);
                 }
                 m.pass(tokens[0..n], q0[0..n], slots[0..n], steps) catch |err| refused(err);
+            },
+            // a marked pass's plan and its rows (xedit.zig), after its fill's start: rank 0 checked the same plan against
+            // the same prompt, so a refusal here is this rank's setup (TF_DS_XEDIT), and rank 0 will run the plan's
+            // collectives: the pair cannot go on
+            .fill_mark => {
+                const plan = try xedit.Plan.get(&r);
+                m.xeSet(plan, seqs[slot].items.len) catch |err| xeFault(err);
+            },
+            .fill_xdata => {
+                const off: usize = @intCast(try r.int(u64));
+                m.xeData(off, r.rest()) catch |err| xeFault(err);
             },
             .fill_images => {
                 const count = try r.int(u32);

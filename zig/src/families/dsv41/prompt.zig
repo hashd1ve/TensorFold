@@ -1396,18 +1396,6 @@ pub fn tap(e: *const Engine, ch: *Chunk, j: usize) !void {
     try e.exact.hcMean4(e.s, ch.h, ch.taps + j * ch.cap * c.hidden * 2, c.hidden, ch.n, c.hidden);
 }
 
-/// An extra tap (xtaps.zig): the mean of the streams as they enter the next layer, into out (bf16 [n, D]), the streams
-/// and the pending MoE gather left as they are: a pending post goes into `scratch` (bf16 [n, hc, D]), not the streams.
-pub fn xtap(e: *const Engine, ch: *const Chunk, scratch: u64, out: u64) !void {
-    const c = e.c;
-    var src = ch.h;
-    if (ch.pending) {
-        try tri_basic.hcPost(e.t, ch.gm, ch.h, ch.post, ch.comb, scratch, e.world, ch.n, c.hidden);
-        src = scratch;
-    }
-    try e.exact.hcMean4(e.s, src, out, c.hidden, ch.n, c.hidden);
-}
-
 /// Tap j's rows (bf16 [n, D]).
 pub fn tapRows(e: *const Engine, ch: *const Chunk, j: usize) u64 {
     return ch.taps + j * ch.cap * e.c.hidden * 2;
@@ -1423,13 +1411,34 @@ pub fn head(e: *const Engine, ch: *Chunk) !void {
         try tri_basic.hcPost(e.t, ch.gm, ch.h, ch.post, ch.comb, ch.h, e.world, n, c.hidden);
         ch.pending = false;
     }
-    const last_h = ch.h + (n - 1) * c.hc * c.hidden * 2;
-    const last_pre = ch.pre + (n - 1) * c.hc * 4;
-    try tri_basic.collapseNorm(e.t, last_h, last_pre, e.w.norm, ch.head_x, c.eps, 1, c.hidden);
+    try headRow(e, ch, ch.h + (n - 1) * c.hc * c.hidden * 2, ch.pre + (n - 1) * c.hc * 4);
+}
+
+/// The head on one row: collapse_norm of its streams `h` (bf16 [hc, D]) with `pre` (fp32 [hc]), the head's columns and
+/// their gather into head_g. The prompt's head on its last row, and xedit.zig's lens on the streams entering a layer
+/// (every rank runs it: the columns are split between them).
+pub fn headRow(e: *const Engine, ch: *const Chunk, h: u64, pre: u64) !void {
+    const c = e.c;
+    try tri_basic.collapseNorm(e.t, h, pre, e.w.norm, ch.head_x, c.eps, 1, c.hidden);
     const hl = e.w.head;
     try mmRows(e, ch, 1, hl, ch.head_x, c.hidden, ch.head_l, .fp32, hl.n);
     if (e.two) |t| return t.quarters(e, ch.head_l, ch.head_g, 1, t.hw, 4); // 2D: the vocabulary quarters, TP2's layout
     try e.comm.allGather(ch.head_l, ch.head_g, hl.n, .f32, e.s);
+}
+
+/// The streams as they enter the next layer, read without changing them: the chunk's own when no MoE post is pending,
+/// else a posted copy in `scratch` (bf16 [n, hc, D]), the streams and the pending gather left as they are.
+pub fn postedStreams(e: *const Engine, ch: *const Chunk, scratch: u64) !u64 {
+    if (!ch.pending) return ch.h;
+    try tri_basic.hcPost(e.t, ch.gm, ch.h, ch.post, ch.comb, scratch, e.world, ch.n, e.c.hidden);
+    return scratch;
+}
+
+/// A pending MoE post applied to the streams in place (as a DSpark tap or an Engram layer does), before an edit.
+pub fn postNow(e: *const Engine, ch: *Chunk) !void {
+    if (!ch.pending) return;
+    try tri_basic.hcPost(e.t, ch.gm, ch.h, ch.post, ch.comb, ch.h, e.world, ch.n, e.c.hidden);
+    ch.pending = false;
 }
 
 /// A layer's end: the MoE's gather is pending (the next layer's attention mixes post it) and the FFN's pre_out is the

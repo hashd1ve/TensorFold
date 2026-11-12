@@ -30,6 +30,7 @@ const ring2d = @import("ring2d.zig");
 const rdma = @import("rdma.zig");
 const rdma_env = @import("rdma_env.zig");
 const xtaps = @import("xtaps.zig");
+const xedit = @import("xedit.zig");
 
 /// The served prompt chunk (TF_DS_PREFILL_CHUNK): a prompt runs in chunks that start at its multiples.
 pub const chunk_rows = 2048;
@@ -68,6 +69,24 @@ pub const Options = struct {
     vision_bias: ?[]const u8 = null, // gate_bias_vl.safetensors (null: the kit's vision/): the image-span routing bias
     xtaps: ?[]const u8 = null, // TF_DS_XTAPS: the layers a marked prompt pass taps (xtaps.zig; rank 0; null: none)
     xtaps_dir: ?[]const u8 = null, // TF_DS_XTAPS_DIR: where its files go
+    xtaps_rows: usize = 0, // TF_DS_XTAPS_ROWS: a marked pass's chunk rows at most (0: a chunk's; fewer: smaller buffers)
+};
+
+/// xedit.zig on this rank (TF_DS_XEDIT=MiB, every rank): the edits' rows on the device, the one-stream pres of the
+/// lens, and the plan of the marked pass that is filling (set after its fill begins, gone at the next fill's start).
+pub const XEdit = struct {
+    data: cuda.DeviceBuffer, // fp32 [cap_rows, hidden]
+    cap_rows: usize,
+    onehot: cuda.DeviceBuffer, // fp32 [hc, hc]: row s reads stream s alone
+    scratch: ?cuda.DeviceBuffer = null, // bf16 [a chunk's rows, hc, hidden]: the lens's posted streams on a rank without xtaps
+    lens_host: []f32, // a lens row on its way to the file (rank 0)
+    plan: ?xedit.Plan = null,
+
+    fn deinit(x: *XEdit) void {
+        x.data.free();
+        x.onehot.free();
+        if (x.scratch) |*b| b.free();
+    }
 };
 
 pub const Model = struct {
@@ -152,6 +171,14 @@ pub const Model = struct {
     // (lanes sets it before each chunk; null: an unmarked pass, which launches nothing more than it always did)
     xt: ?xtaps.XTaps = null,
     xt_sink: ?*xtaps.Sink = null,
+    xt_lens: u8 = 0, // that pass's lens rows in its file: 0 none, 1 their largest logits, 2 whole (lanes sets it with xt_sink)
+    xt_streams: usize = 0, // the prompt's last positions whose streams go to the file (the same)
+    // xedit.zig (TF_DS_XEDIT, every rank); the filling prompt's length and whether the chunk that runs next is its last
+    // (lanes on rank 0 and the follower set both before each chunk)
+    xe: ?XEdit = null,
+    xdir: ?[]const u8 = null, // TF_DS_XTAPS_DIR: where the edits files are read from (rank 0)
+    fill_len: usize = 0,
+    fill_last: bool = false,
 
     /// Loads rank o.rank's weights from the lane's rank cache, links the ranks (rank 0 listens on o.port), opens NCCL
     /// and sets up every buffer. Needs `ctx` current on this thread.
@@ -166,6 +193,12 @@ pub const Model = struct {
         m.img_buf = null;
         m.xt = null;
         m.xt_sink = null;
+        m.xt_lens = 0;
+        m.xt_streams = 0;
+        m.xe = null;
+        m.xdir = null;
+        m.fill_len = 0;
+        m.fill_last = false;
         m.host = std.heap.ArenaAllocator.init(gpa);
         errdefer m.host.deinit();
         const a = m.host.allocator();
@@ -368,12 +401,32 @@ pub const Model = struct {
 
         m.host_pos = try a.alloc(i64, chunk_rows);
         m.ids64 = try a.alloc(i64, chunk_rows);
+        if (o.xtaps_dir) |p| m.xdir = try a.dupe(u8, p);
         if (o.xtaps) |spec| if (o.rank == 0) {
-            m.xt = try xtaps.XTaps.init(a, m.ctx.d, spec, o.xtaps_dir orelse return error.NoXTapsDir, c.layers, c.hidden, c.hc, chunk_rows);
-            std.log.info("dsv41: extra taps at {d} layers for marked prompt passes ({d} MiB on the device), their files in {s}", .{ m.xt.?.n, m.xt.?.bytes() >> 20, m.xt.?.dir });
+            m.xt = try xtaps.XTaps.init(a, m.ctx.d, spec, o.xtaps_dir orelse return error.NoXTapsDir, c.layers, c.hidden, c.hc, if (o.xtaps_rows == 0) chunk_rows else o.xtaps_rows, chunk_rows);
+            std.log.info("dsv41: extra taps at {d} layers for marked prompt passes of at most {d} rows a chunk ({d} MiB on the device), their files in {s}", .{ m.xt.?.n, m.xt.?.cap, m.xt.?.bytes() >> 20, m.xt.?.dir });
         };
+        errdefer if (m.xt) |*x| x.deinit();
         m.vocab = sp.world * (if (m.two) |t| t.hw[0] + t.hw[1] else m.w.head.n); // 2D: both pairs' vocabulary parts
         m.logits = try a.alloc(f32, round.max_rows * m.vocab);
+        // xedit.zig, read on each rank (they must agree: start.sh gives it to both): the edits' rows and the lens's pres
+        if (std.c.getenv("TF_DS_XEDIT")) |v| {
+            const mib = std.fmt.parseInt(usize, std.mem.span(v), 10) catch return error.BadXEdit;
+            if (mib > 4096 or c.hc > 8) return error.BadXEdit;
+            if (mib > 0) {
+                const cap_rows = (mib << 20) / (c.hidden * 4);
+                if (cap_rows == 0) return error.BadXEdit;
+                var x: XEdit = .{ .data = try cuda.DeviceBuffer.alloc(d, cap_rows * c.hidden * 4), .cap_rows = cap_rows, .onehot = undefined, .lens_host = try a.alloc(f32, m.vocab) };
+                errdefer x.data.free();
+                var eye: [64]f32 = @splat(0);
+                for (0..c.hc) |st| eye[st * c.hc + st] = 1;
+                x.onehot = try cuda.DeviceBuffer.fromHost(d, std.mem.sliceAsBytes(eye[0 .. c.hc * c.hc]));
+                errdefer x.onehot.free();
+                if (m.xt == null) x.scratch = try cuda.DeviceBuffer.alloc(d, chunk_rows * c.hc * c.hidden * 2);
+                m.xe = x;
+                std.log.info("dsv41: edits and the lens for marked prompt passes (rank {d}): {d} rows of edits at most ({d} MiB on the device)", .{ o.rank, cap_rows, (x.data.len + (if (x.scratch) |b| b.len else 0)) >> 20 });
+            }
+        }
         return m;
     }
 
@@ -382,6 +435,7 @@ pub const Model = struct {
         m.stream.synchronize() catch {};
         if (m.img_buf) |*b| b.free();
         if (m.xt) |*x| x.deinit();
+        if (m.xe) |*x| x.deinit();
         m.spans.deinit(m.gpa);
         if (m.graphs) |*g| g.deinit();
         if (m.pgraphs) |*g| g.deinit();
@@ -585,6 +639,8 @@ pub const Model = struct {
         }
         m.spans.clearRetainingCapacity();
         m.ch.spans = &.{};
+        if (m.xe) |*x| x.plan = null; // (a marked pass's plan comes after its fill begins, and nothing cuts into it)
+        m.fill_last = false;
         m.view = try m.caches.view(&m.eng, slot, base);
         for (m.rings, m.ring_view) |r, *v| v.* = r + slot * m.eng.ringBytes();
         m.fill_slot = slot;
@@ -612,7 +668,13 @@ pub const Model = struct {
         const taps = m.dr != null;
         // a marked pass's extra taps (xtaps.zig): the rows each listed layer's tap holds of this chunk
         const xt: ?*xtaps.XTaps = if (m.xt_sink != null) &m.xt.? else null;
-        if (xt) |x| x.at = @splat(.{});
+        if (xt) |x| {
+            x.at = @splat(.{});
+            x.mix_at = @splat(@splat(.{}));
+        }
+        // a marked pass (xtaps.zig's taps on rank 0, xedit.zig's plan on every rank): its edits, lens and taps of the
+        // streams entering each layer
+        const marked = xt != null or (m.xe != null and m.xe.?.plan != null);
         var floor: usize = 0;
         var kv_done: ?usize = null;
         // Engram rows read ahead on a thread while the GPU runs the layers before them (the served reader pool's
@@ -642,9 +704,9 @@ pub const Model = struct {
             }
         }
         for (0..c.layers) |li| {
-            // an extra tap reads the streams as they enter the layer: before its Engram, and at the decoder's first
-            // layer before the replay cut (every row of the chunk)
-            if (xt) |x| try m.xtTap(x, li);
+            // an edit changes and an extra tap reads the streams as they enter the layer: before its Engram, and at the
+            // decoder's first layer before the replay cut (every row of the chunk)
+            if (marked) try m.markAt(li);
             if (li == c.layers / 2) {
                 if (!try prompt.replayCut(e, ch, &m.view, &shared, li, replay, m.host_pos)) {
                     // encoder-only: no synchronize either (as at the chunk's end below), so the next chunk's host steps
@@ -692,12 +754,14 @@ pub const Model = struct {
             // a DSpark tap reads the streams after the layer's Engram (_forward_k's order)
             if (taps) if (std.mem.indexOfScalar(u16, c.dspark_taps.slice(), @intCast(li))) |j| try prompt.tap(e, ch, j);
             try prompt.attnMixes(e, ch, li);
+            if (xt) |x| try m.xtMix(x, li, 0, ch.pre);
             if (pt) |t| try t.mark(m.stream, .mix_attn);
             try prompt.attention(e, ch, &m.view, &shared, li, m.ring_view[li], floor, kv_done != null and kv_done.? == li);
             if (pt) |t| try t.mark(m.stream, .attn);
             try prompt.gather(e, ch, ch.pa, ch.ga);
             if (pt) |t| try t.mark(m.stream, .gather_a);
             try prompt.ffnMixes(e, ch, li);
+            if (xt) |x| try m.xtMix(x, li, 1, ch.pre_a);
             if (pt) |t| try t.mark(m.stream, .mix_ffn);
             try prompt.moe(e, ch, li);
             if (pt) |t| try t.mark(m.stream, .moe);
@@ -705,7 +769,7 @@ pub const Model = struct {
             if (pt) |t| try t.mark(m.stream, .gather_m);
             prompt.endLayer(ch);
         }
-        if (xt) |x| try m.xtTap(x, c.layers); // the streams after the last layer
+        if (marked) try m.markAt(c.layers); // the streams after the last layer
         try prompt.head(e, ch);
         if (pt) |t| try t.mark(m.stream, .head);
         if (m.dr) |*dr| {
@@ -729,11 +793,132 @@ pub const Model = struct {
         return true;
     }
 
-    /// A marked pass's tap of the streams entering `layer`, when it is listed: this chunk's rows there.
-    fn xtTap(m: *Model, x: *xtaps.XTaps, layer: usize) !void {
-        const j = x.index(layer) orelse return;
-        try prompt.xtap(&m.eng, &m.ch, x.scratch.ptr, x.rows(j));
-        x.at[j] = .{ .start = m.ch.start, .n = m.ch.n };
+    /// A marked pass at the streams entering `layer`: the plan's edits there (every rank), then on the prompt's last
+    /// chunk the lens of a listed layer (every rank: the head's columns and their gather), then rank 0's tap of a
+    /// listed layer: the streams' mean of this chunk's rows, and the streams themselves of the prompt's last positions
+    /// a request asked for. The lens and the taps read the streams as they are after the edits, a pending MoE post in a
+    /// scratch copy.
+    fn markAt(m: *Model, layer: usize) !void {
+        const e = &m.eng;
+        const ch = &m.ch;
+        const plan: ?*const xedit.Plan = if (m.xe) |*x| (if (x.plan) |*p| p else null) else null;
+        if (plan) |p| try m.xeEdits(p, layer);
+        const lens = if (plan) |p| m.fill_last and p.lensIndex(layer) != null else false;
+        const xt: ?*xtaps.XTaps = if (m.xt_sink != null) &m.xt.? else null;
+        const tap: ?usize = if (xt) |x| x.index(layer) else null;
+        if (!lens and tap == null) return;
+        const scratch = if (m.xt) |*x| x.scratch.ptr else if (m.xe) |*x| (if (x.scratch) |b| b.ptr else return error.NoXEditScratch) else return error.NoXEditScratch;
+        const src = try prompt.postedStreams(e, ch, scratch);
+        if (lens) try m.xeLens(layer, src);
+        if (tap) |j| {
+            const x = xt.?;
+            if (ch.n > x.cap) return error.XTapsRows; // (lanes refuses such a prompt before its pass)
+            try e.exact.hcMean4(e.s, src, x.rows(j), e.c.hidden, ch.n, e.c.hidden);
+            x.at[j] = .{ .start = ch.start, .n = ch.n };
+            if (m.xt_streams > 0) try m.xtStreams(x, layer, src);
+        }
+    }
+
+    /// The plan's edits of the streams entering `layer`, on this chunk's rows of each one's positions.
+    fn xeEdits(m: *Model, p: *const xedit.Plan, layer: usize) !void {
+        const e = &m.eng;
+        const c = e.c;
+        const ch = &m.ch;
+        const x = &m.xe.?;
+        const row_h = c.hc * c.hidden * 2;
+        const all: u32 = (@as(u32, 1) << @intCast(c.hc)) - 1;
+        for (p.edits[0..p.n]) |ed| {
+            if (ed.layer != layer) continue;
+            const lo: usize = @max(@as(usize, @intCast(ed.start)), ch.start);
+            const hi: usize = @min(@as(usize, @intCast(ed.end)), ch.start + ch.n);
+            if (lo >= hi) continue;
+            try prompt.postNow(e, ch);
+            const per_row = ed.op.perRow();
+            const first: usize = @as(usize, @intCast(ed.row)) + (if (per_row) lo - @as(usize, @intCast(ed.start)) else 0);
+            try e.ops.xedit(e.s, ch.h + (lo - ch.start) * row_h, x.data.ptr + first * c.hidden * 4, if (per_row) c.hidden else 0, hi - lo, c.hidden, c.hc, @intFromEnum(ed.op), if (ed.mask == 0) all else ed.mask, ed.scale);
+        }
+    }
+
+    /// The lens of the streams `src` entering `layer` (the chunk's rows; its last is the prompt's last position): the
+    /// head on that row with the layer's own pre (mode 0), then on each stream alone (mode 1 + s). Rank 0 writes each
+    /// row to the marked pass's file as it comes.
+    fn xeLens(m: *Model, layer: usize, src: u64) !void {
+        const e = &m.eng;
+        const c = e.c;
+        const ch = &m.ch;
+        const x = &m.xe.?;
+        const d = m.ctx.d;
+        const last_h = src + (ch.n - 1) * c.hc * c.hidden * 2;
+        for (0..c.hc + 1) |mode| {
+            const pre = if (mode == 0) ch.pre + (ch.n - 1) * c.hc * 4 else x.onehot.ptr + (mode - 1) * c.hc * 4;
+            try prompt.headRow(e, ch, last_h, pre);
+            const sink = m.xt_sink orelse continue;
+            if (m.xt_lens == 0) continue;
+            try m.stream.synchronize();
+            try d.check(d.api.cuMemcpyDtoH_v2(x.lens_host.ptr, ch.head_g, m.vocab * 4), "cuMemcpyDtoH");
+            if (m.xt_lens == 2) sink.lensFull(@intCast(layer), @intCast(mode), x.lens_host) else sink.lensTop(@intCast(layer), @intCast(mode), x.lens_host);
+        }
+    }
+
+    /// The streams themselves of the prompt's last xt_streams positions entering `layer`, this chunk's rows of them,
+    /// to the marked pass's file.
+    fn xtStreams(m: *Model, x: *xtaps.XTaps, layer: usize, src: u64) !void {
+        const sink = m.xt_sink orelse return;
+        const c = m.eng.c;
+        const ch = &m.ch;
+        const d = m.ctx.d;
+        const lo = @max(m.fill_len -| m.xt_streams, ch.start);
+        const hi = ch.start + ch.n;
+        if (lo >= hi) return;
+        const row = c.hc * c.hidden * 2;
+        const n = hi - lo;
+        if (n * row > x.shost.len) return error.XTapsRows;
+        const b = x.shost[0 .. n * row];
+        try m.stream.synchronize();
+        try d.check(d.api.cuMemcpyDtoH_v2(b.ptr, src + (lo - ch.start) * row, b.len), "cuMemcpyDtoH");
+        sink.streams(@intCast(layer), lo, n, c.hc, b);
+    }
+
+    /// A sublayer's mixes of this chunk's rows into the marked pass's buffers: the pre it read the streams with, and the
+    /// post and comb its output goes back with (the chunk's, just written by the sublayer's mixes).
+    fn xtMix(m: *Model, x: *xtaps.XTaps, layer: usize, sub: usize, pre: u64) !void {
+        const ch = &m.ch;
+        const d = m.ctx.d;
+        const n = ch.n;
+        if (n > x.cap) return error.XTapsRows;
+        const hc = x.hc;
+        const dst = x.mixes(layer, sub);
+        const h = m.stream.handle;
+        try d.check(d.api.cuMemcpyDtoDAsync_v2(dst, pre, n * hc * 4, h), "cuMemcpyDtoDAsync");
+        try d.check(d.api.cuMemcpyDtoDAsync_v2(dst + x.cap * hc * 4, ch.post, n * hc * 4, h), "cuMemcpyDtoDAsync");
+        try d.check(d.api.cuMemcpyDtoDAsync_v2(dst + 2 * x.cap * hc * 4, ch.comb, n * hc * hc * 4, h), "cuMemcpyDtoDAsync");
+        x.mix_at[layer][sub] = .{ .start = ch.start, .n = n };
+    }
+
+    /// Whether this rank takes plans (TF_DS_XEDIT).
+    pub fn xeOn(m: *const Model) bool {
+        return m.xe != null;
+    }
+
+    /// The plan of the pass that has just begun to fill (after fillBegin, before its chunks), checked against this
+    /// model, the prompt's length and this rank's buffer.
+    pub fn xeSet(m: *Model, plan: xedit.Plan, len: usize) !void {
+        const x = if (m.xe) |*x| x else return error.XEditOff;
+        try plan.check(m.cfg.layers, m.cfg.hc, len, x.cap_rows);
+        if (plan.n_lens > 0 and m.xt == null and x.scratch == null) return error.NoXEditScratch;
+        x.plan = plan;
+    }
+
+    /// `bytes` of the set plan's rows at byte `off` of them, in the stream's order (after any pass still running).
+    pub fn xeData(m: *Model, off: usize, bytes: []const u8) !void {
+        const x = if (m.xe) |*x| x else return error.XEditOff;
+        const p = x.plan orelse return error.XEditOff;
+        const total = @as(usize, @intCast(p.rows)) * m.cfg.hidden * 4;
+        if (off > total or bytes.len > total - off) return error.BadFrame;
+        if (bytes.len == 0) return;
+        const d = m.ctx.d;
+        try d.check(d.api.cuMemcpyHtoDAsync_v2(x.data.ptr + off, bytes.ptr, bytes.len, m.stream.handle), "cuMemcpyHtoDAsync");
+        try m.stream.synchronize(); // (the caller's bytes may go once this returns)
     }
 
     /// The chunk's taps to the marked pass's file, once its kernels are done.
@@ -747,6 +932,17 @@ pub const Model = struct {
             try d.check(d.api.cuMemcpyDtoH_v2(b.ptr, x.rows(j), b.len), "cuMemcpyDtoH");
             sink.rows(x.layers[j], mk.start, mk.n, b);
         }
+        const hc = x.hc;
+        for (0..m.cfg.layers) |li| for (0..2) |sub| {
+            const mk = x.mix_at[li][sub];
+            if (mk.n == 0) continue;
+            const b = x.mhost[0 .. mk.n * x.mixRow()];
+            const src = x.mixes(li, sub);
+            try d.check(d.api.cuMemcpyDtoH_v2(b.ptr, src, mk.n * hc * 4), "cuMemcpyDtoH");
+            try d.check(d.api.cuMemcpyDtoH_v2(b.ptr + mk.n * hc * 4, src + x.cap * hc * 4, mk.n * hc * 4), "cuMemcpyDtoH");
+            try d.check(d.api.cuMemcpyDtoH_v2(b.ptr + 2 * mk.n * hc * 4, src + 2 * x.cap * hc * 4, mk.n * hc * hc * 4), "cuMemcpyDtoH");
+            sink.mix(@intCast(li), @intCast(sub), mk.start, mk.n, hc, b);
+        };
     }
 
     /// The prompt's logits (its last row's, the ranks' columns in rank order) after a fill's last chunk.

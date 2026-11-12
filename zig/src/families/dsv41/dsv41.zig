@@ -49,6 +49,7 @@ pub const markov_tokens = @import("markov_tokens.zig");
 pub const draft = @import("draft.zig");
 pub const sampling = @import("sampling.zig");
 pub const xtaps = @import("xtaps.zig");
+pub const xedit = @import("xedit.zig");
 pub const model = @import("model.zig");
 pub const lanes = @import("lanes.zig");
 
