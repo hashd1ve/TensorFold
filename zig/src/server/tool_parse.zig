@@ -144,14 +144,13 @@ pub fn parse(a: Allocator, text: []const u8, tools: []const Value, max_calls: ?u
     for (envs) |env| {
         try residue.appendSlice(a, text[cursor..env.start]);
         cursor = env.end;
-        if (std.mem.startsWith(u8, env.payload, dsml41_open)) {
-            try dsml41Calls(a, env.payload[dsml41_open.len .. env.payload.len - dsml41_close.len], &known, max_calls, &calls);
+        if (dsmlBlock(env.payload, dsml41_open, dsml41_close)) |inner| {
+            try dsml41Calls(a, inner, &known, max_calls, &calls);
             continue;
         }
         if (max_calls) |m| if (calls.items.len >= m) continue;
         const parsed: ?[]Call = blk: {
-            if (std.mem.startsWith(u8, env.payload, dsml_open)) {
-                const inner = env.payload[dsml_open.len .. env.payload.len - dsml_close.len];
+            if (dsmlBlock(env.payload, dsml_open, dsml_close)) |inner| {
                 break :blk dsmlCalls(a, inner) catch |e| switch (e) {
                     error.OutOfMemory => return error.OutOfMemory,
                     error.Invalid => null,
@@ -197,6 +196,15 @@ pub fn closeCall(a: Allocator, text: []const u8, tools: []const Value) Allocator
     // the strict reading: one whole call to an offered tool, nothing but its markup
     if ((try parse(a, closed, tools, 1)).calls == null) return "";
     return std.mem.concat(a, u8, &.{ tail, "</tool_call>" });
+}
+
+/// The inside of ``body`` (an envelope's payload) when it opens with a DSML opener, read as it always was: the opener cut
+/// from its start and a closer's length from its end. The payload of a ``<tool_call>`` block (or another tool-call
+/// envelope) can open with a DSML opener and be too short to hold a closer as well; cutting both from it would slice past
+/// its own start, so it reads as no DSML block. Every payload long enough reads as before.
+fn dsmlBlock(body: []const u8, open: []const u8, close: []const u8) ?[]const u8 {
+    if (body.len < open.len + close.len or !std.mem.startsWith(u8, body, open)) return null;
+    return body[open.len .. body.len - close.len];
 }
 
 /// What a call's arguments lack to close: XML's ``

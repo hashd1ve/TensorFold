@@ -4,6 +4,8 @@ const json = @import("json.zig");
 const tool_parse = @import("tool_parse.zig");
 const parse = tool_parse.parse;
 const closeCall = tool_parse.closeCall;
+const reply_text = @import("reply_text.zig");
+const tool_stream = @import("tool_stream.zig");
 
 test "families" {
     var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
@@ -179,4 +181,74 @@ test "a DSML block is read from its own tags: <tool_call> text around it or in a
     // the call streamer reads only the text before the first block
     try std.testing.expectEqualStrings("Hi. ", tool_parse.beforeDsml("Hi. " ++ block ++ " more"));
     try std.testing.expectEqualStrings("no block", tool_parse.beforeDsml("no block"));
+}
+
+test "a tool-call block too short to hold the DSML block it opens with is no DSML block: no call, text in a whole reply, dropped in a one-call reply, no stream sends a call" {
+    const D = "\u{ff5c}DSML\u{ff5c}";
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const tools = (try json.parse(a, "[{\"type\":\"function\",\"function\":{\"name\":\"write\"}}]")).ok.array;
+    const short = [_][]const u8{
+        "<tool_call><" ++ D ++ " calls></tool_call>",
+        "<tool_call><" ++ D ++ "tool_calls></tool_call>",
+        "Sure: <tool_call> <" ++ D ++ " calls> x </tool_call>",
+        "<TOOL_CALL><" ++ D ++ " calls></TOOL_CALL>",
+        "<|tool_call><" ++ D ++ " calls><tool_call|>",
+        "<ns:tool_call><" ++ D ++ "tool_calls></ns:tool_call>",
+        "<tool_call><" ++ D ++ " calls></" ++ D ++ " calls</tool_call>", // one byte short
+        "<tool_call><" ++ D ++ "tool_calls></" ++ D ++ "tool_calls</tool_call>", // one byte short, V4
+    };
+    // the stream filter's text at the end of each reply: it hides an unclosed DSML block from its opener on
+    const streamed_text = [_][]const u8{ "", "", "Sure:", "<TOOL_CALL>", "", "<ns:tool_call>", "", "" };
+    for (short, streamed_text) |text, shown| {
+        // with no limit the block stays the reply's text; a one-call reply drops it and keeps the prose before it
+        const r = try parse(a, text, tools, null);
+        try std.testing.expect(r.calls == null);
+        try std.testing.expectEqualStrings(text, r.content);
+        const one = try parse(a, text, tools, 1);
+        try std.testing.expect(one.calls == null);
+        try std.testing.expectEqualStrings(if (std.mem.startsWith(u8, text, "Sure:")) "Sure:" else "", one.content);
+        try std.testing.expectEqualStrings(shown, std.mem.trim(u8, try reply_text.hideToolCalls(a, text, true), " \t\r\n"));
+        // the live streamers, fed byte by byte, send no call: the <tool_call> one and the DSML one
+        var st = try tool_stream.Streamer.init(a, tools);
+        var out: std.ArrayList(json.Value) = .empty;
+        for (1..text.len + 1) |n| {
+            try st.feed(text[0..n], &out);
+            try st.feedDsml(text[0..n], &out);
+        }
+        try std.testing.expect(!st.streamed);
+        try std.testing.expectEqual(@as(usize, 0), out.items.len);
+    }
+    // after an offered call, either spelling, each limit: a V4 block is read after the limit is checked, a V4.1 block
+    // before it, so before the guard a V4.1 block crashed the parser at any limit and a V4 block only with no limit
+    const call = "<tool_call>{\"name\": \"write\", \"arguments\": {}}</tool_call>";
+    for ([_][]const u8{ "<tool_call><" ++ D ++ "tool_calls></tool_call>", "<tool_call><" ++ D ++ " calls></tool_call>" }) |block| {
+        const text = try std.mem.concat(a, u8, &.{ call, "\n", block });
+        const unlimited = try parse(a, text, tools, null);
+        try std.testing.expectEqual(@as(usize, 1), unlimited.calls.?.len);
+        try std.testing.expectEqualStrings(block, unlimited.content);
+        const none = try parse(a, text, tools, 0);
+        try std.testing.expect(none.calls == null);
+        try std.testing.expectEqualStrings("", none.content);
+        const one = try parse(a, text, tools, 1);
+        try std.testing.expectEqual(@as(usize, 1), one.calls.?.len);
+        try std.testing.expectEqualStrings("", one.content);
+    }
+    // long enough, a payload reads exactly as it always did, with or without a closer at its end: these are the parser's
+    // results before the guard, unchanged (content with no limit, then with a one-call limit; no call in any of them)
+    const long_enough = [_][3][]const u8{
+        .{ "<tool_call><" ++ D ++ " calls></" ++ D ++ " calls></tool_call>", "<tool_call></tool_call>", "<tool_call></tool_call>" },
+        .{ "<tool_call><" ++ D ++ "tool_calls></" ++ D ++ "tool_calls></tool_call>", "<tool_call><" ++ D ++ "tool_calls></" ++ D ++ "tool_calls></tool_call>", "" },
+        .{ "<tool_call><" ++ D ++ " calls>0123456789012345678901</tool_call>", "", "" },
+        .{ "<tool_call><" ++ D ++ "tool_calls>01234567890123456789012345</tool_call>", "<tool_call><" ++ D ++ "tool_calls>01234567890123456789012345</tool_call>", "" },
+    };
+    for (long_enough) |c| {
+        const r = try parse(a, c[0], tools, null);
+        try std.testing.expect(r.calls == null);
+        try std.testing.expectEqualStrings(c[1], r.content);
+        const one = try parse(a, c[0], tools, 1);
+        try std.testing.expect(one.calls == null);
+        try std.testing.expectEqualStrings(c[2], one.content);
+    }
 }
