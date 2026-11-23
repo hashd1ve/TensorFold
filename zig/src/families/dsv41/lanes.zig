@@ -263,6 +263,13 @@ pub fn parseMs(a: std.mem.Allocator, text: []const u8) ![]const f64 {
     return out.items;
 }
 
+/// A calibration weight ("0.5"): finite, from 0 (off) to 1 (TF_DS_T25_DRAFT_CAL).
+pub fn parseCalWeight(text: []const u8) !f64 {
+    const v = try std.fmt.parseFloat(f64, std.mem.trim(u8, text, " "));
+    if (!std.math.isFinite(v) or v < 0.0 or v > 1.0) return error.BadDraftCal;
+    return v;
+}
+
 /// A stream's place in the pool and the drafts it holds.
 const Lane = struct {
     slot: usize,
@@ -343,6 +350,8 @@ pub const Lanes = struct {
     prof: ?Profile = null,
     fix_k: ?usize = null, // a measurement (tf-dsv41-lanes --fix-k): K drafts a stream, chances 1 to K and 0 past it
     solo_overhead: bool = false, // TF_DS_SOLO_OVERHEAD=1: a lone drafted stream's head windows cost the fixed draft allowance
+    draft_cal: f64 = 0.0, // TF_DS_T25_DRAFT_CAL: the weight of a round in each stream's draft-survival calibration (0: off)
+    cal_log: u32 = 0, // TF_DS_T25_CAL_LOG: every n-th calibrated verify of a stream prints to stderr (0: off)
     no_copies: bool = false, // TF_DS_NO_COPIES=1: a drafted stream proposes no suffix-lookup copy windows
     drawn: [ring]u32 = undefined,
     next: u64 = 0,
@@ -402,6 +411,8 @@ pub const Lanes = struct {
             .window_costs = self.wc[0..],
             .mtp_step_ms = draft.draft_ms,
             .solo_head_overhead_ms = if (drafting and self.solo_overhead) draft.draft_ms else null, // opt-in: the Python engine's fixed draft allowance
+            .draft_cal = self.draft_cal,
+            .cal_log = self.cal_log,
             .copy_proposals = !(drafting and self.no_copies), // opt-in: the draft head proposes; the Python engine makes no copies either
             .streams_exact = true,
             .hidden_rows = true,
@@ -1260,6 +1271,15 @@ pub fn follow(gpa: std.mem.Allocator, m: *Model) !void {
             },
             .done => return,
         }
+    }
+}
+
+test "a calibration weight parses to a finite value in 0..1" {
+    try std.testing.expectEqual(@as(f64, 0.5), try parseCalWeight(" 0.5 "));
+    try std.testing.expectEqual(@as(f64, 1.0), try parseCalWeight("1"));
+    try std.testing.expectEqual(@as(f64, 0.0), try parseCalWeight("0"));
+    for ([_][]const u8{ "-0.1", "1.01", "2", "abc", "", "nan", "inf", "-inf" }) |bad| {
+        try std.testing.expect(std.meta.isError(parseCalWeight(bad)));
     }
 }
 

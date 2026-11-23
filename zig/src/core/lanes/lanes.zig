@@ -32,4 +32,5 @@ test {
     std.testing.refAllDecls(@This());
     _ = @import("engine_test.zig");
     _ = @import("gpu_full_test.zig");
+    _ = @import("calibration_test.zig");
 }
